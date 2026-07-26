@@ -95,21 +95,47 @@ Confirmed during planning (2026-07-27):
         `port_shtc3.cpp` is a fully self-contained hand-rolled I2C driver that never
         references that package; the original example's manifest listed it but no source
         file in `port_bsp` actually calls into it.
-- [ ] **Secrets handling**: `main/secrets.h` (gitignored) defining `BACKEND_BASE_URL` and
+- [x] **Secrets handling**: `main/secrets.h` (gitignored) defining `BACKEND_BASE_URL` and
       `API_TOKEN` as compile-time constants, matching the spec's "hardcoded, rotated by
-      reflashing" model. Commit a `main/secrets.h.example` template with placeholders.
-- [ ] **Host-based unit tests** for the pure-logic pieces that don't need hardware — put
-      JSON parsing of the `/device/sync` response, POSIX-TZ application logic, and the
-      sync retry/backoff state machine in their own component (e.g.
-      `components/sync_proto`, using `cJSON`), with a Unity test app under
-      `components/sync_proto/test/` built for ESP-IDF's `linux` target
-      (`idf.py --preview set-target linux build`, then run the resulting host binary
-      directly — confirm exact invocation against the installed 5.5.1 docs during setup,
-      since host-target flags have shifted across ESP-IDF versions).
+      reflashing" model. Committed `main/secrets.h.example` template with placeholders;
+      `secrets.h` itself currently holds the same placeholders (not real credentials yet) —
+      fill in real values before Phase 1's actual backend sync call.
+- [x] **Host-based unit tests** for the pure-logic pieces that don't need hardware — JSON
+      parsing of the `/device/sync` response (`sync_snapshot.{h,c}`, using `cJSON`,
+      degrading each section independently per spec §5), POSIX-TZ application logic
+      (`tz_apply.{h,c}`), and the sync retry/backoff state machine (`sync_backoff.{h,c}`)
+      live in `components/sync_proto`. Test app is under
+      `components/sync_proto/test_apps/host/`, targeting ESP-IDF's `linux` target.
+      **Correction from the original plan**: ESP-IDF 5.5.1's actual convention for
+      `linux`-target host tests is **Catch2**, not Unity — confirmed by checking the
+      installed IDF's own bundled examples (e.g. `components/log/host_test/log_test`),
+      which all use `espressif/catch2` + a FreeRTOS mock (`tools/mocks/freertos/`) +
+      `set(COMPONENTS main)` to keep the build minimal, with Catch2 providing `main()`
+      instead of the normal ESP-IDF entrypoint. Exact invocation:
+      `idf.py --preview -C components/sync_proto/test_apps/host set-target linux`, then
+      `build`, then run `build/sync_proto_test.elf` directly (not `idf.py monitor`, which
+      doesn't apply to a host binary). Requires two system packages not preinstalled on
+      this machine: `ruby` (FreeRTOS mock codegen) and `libbsd-dev` (linux-target
+      `sys/cdefs.h`) — both installed manually via `sudo apt-get install`. 20 test cases /
+      78 assertions passing.
 
-**Phase 0 verification**: `idf.py build` succeeds for a trivial `app_main` that logs
-"hello" over serial; the host-based Unity test binary builds and runs (even with a
-placeholder passing test).
+**Phase 0 verification**: ✅ `idf.py build` succeeds (`main/adhi-firmware.c` currently holds
+an e-ink + audio smoke test, not just a placeholder — see below). ✅ The host-based Catch2
+test binary (`components/sync_proto/test_apps/host`) builds and runs: 20 test cases / 78
+assertions passing.
+
+**Ahead of Phase 1**: rather than wait for the full bring-up test, did a minimal real-hardware
+smoke test early to validate the build→flash→run loop end to end: `main/adhi-firmware.c`
+powers on the EPD + audio rails, draws a checkerboard via `EPD_Display()` full refresh, and
+plays a generated 440Hz tone through the ES8311 codec. Flashed to the real board (ESP32-S3
+PICO-1, 8MB flash/8MB PSRAM — note our `sdkconfig.defaults` targets the documented 4MB flash
+size, which is fine/conservative but leaves 4MB unused) via `idf.py -p /dev/ttyACM0 flash`.
+Confirmed over serial log: e-ink pattern displayed, codec initialized, tone played, no
+errors. One flashing gotcha: this board's native USB-Serial/JTAG interface doesn't reliably
+auto-reset out of ROM download mode via software (RTS/DTR toggling) — needed a physical
+USB unplug/replug to boot the flashed app. `idf.py monitor` also doesn't work in this
+non-interactive environment (needs a real TTY); reading `/dev/ttyACM0` directly via a
+pyserial script (without touching DTR/RTS) works as a substitute.
 
 ---
 

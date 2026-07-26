@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+    "sync_snapshot.c"
+    "tz_apply.c"
+    "sync_backoff.c"
+    INCLUDE_DIRS
+    "."
+    REQUIRES
+    json
+)
