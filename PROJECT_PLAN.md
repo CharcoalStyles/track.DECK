@@ -53,10 +53,10 @@ Confirmed during planning (2026-07-27):
   ~/esp/esp-idf/install.sh esp32s3
   . ~/esp/esp-idf/export.sh   # source this in each new shell before using idf.py
   ```
-- [ ] **`git init`** in `adhi-firmware`, with a `.gitignore` covering `build/`, `sdkconfig`,
+- [x] **`git init`** in `adhi-firmware`, with a `.gitignore` covering `build/`, `sdkconfig`,
       `sdkconfig.old`, `managed_components/`, `dependencies.lock`, and `main/secrets.h`.
       Commit the existing spec docs + `CLAUDE.md` + this plan as the first commit.
-- [ ] **Project skeleton** at the repo root (not a subdirectory — this repo *is* the
+- [x] **Project skeleton** at the repo root (not a subdirectory — this repo *is* the
       firmware project): `idf.py create-project adhi-firmware`,
       `idf.py set-target esp32s3`, then merge in `sdkconfig.defaults` from the hardware doc
       (4MB QIO flash, **Octal** PSRAM, single factory partition table with no OTA slot —
