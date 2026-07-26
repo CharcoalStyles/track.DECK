@@ -1,0 +1,3 @@
+dependencies:
+  espressif/button: "*"
+  waveshare/pcf85063a: "^1.1.1"

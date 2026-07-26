@@ -61,27 +61,40 @@ Confirmed during planning (2026-07-27):
       `idf.py set-target esp32s3`, then merge in `sdkconfig.defaults` from the hardware doc
       (4MB QIO flash, **Octal** PSRAM, single factory partition table with no OTA slot —
       copy the exact CSV from `ESP32-S3-ePaper-hardware-reference.md`).
-- [ ] **Vendor the driver components**, copied from the local Waveshare clone
+- [x] **Vendor the driver components**, copied from the local Waveshare clone
       (`~/Code/ESP32-S3-ePaper-1.54/02_Example/ESP-IDF/V2/`) rather than written from scratch:
-  - [ ] `11_FactoryProgram/components/port_bsp/port_display.{h,cpp}` — e-paper driver
+  - [x] `11_FactoryProgram/components/port_bsp/port_display.{h,cpp}` — e-paper driver
         (SSD1681 opcodes + LUT tables, copy verbatim, don't regenerate).
-  - [ ] `11_FactoryProgram/components/port_bsp/port_adc.{h,cpp}`, `port_i2c.{h,cpp}` —
-        battery ADC and shared I2C bus init (RTC + SHTC3 + codec).
-  - [ ] `11_FactoryProgram/components/externlib/codec_board/` — ES8311 audio abstraction.
-  - [ ] `11_FactoryProgram/components/externlib/my_button/button.{h,cc}` — debounced
+  - [x] `11_FactoryProgram/components/port_bsp/port_adc.{h,cpp}`, `port_i2c.{h,cpp}` —
+        battery ADC and shared I2C bus init (RTC + SHTC3 + codec). Also vendored
+        `port_power.{h,cpp}` (EPD/audio/VBAT power gating), `port_sdcard.{h,cpp}`,
+        `port_shtc3.{h,cpp}`, `port_codec.{h,cpp}`, and `epaper_config.h` from the same
+        directory — all needed for the Phase 1 bring-up test and not called out
+        individually above. Dropped the dead `canon.pcm`-embed extern declarations in
+        `port_codec.cpp` (unused demo playback data, not part of the real record/playback
+        path) rather than vendoring the asset.
+  - [x] `11_FactoryProgram/components/externlib/codec_board/` — ES8311 audio abstraction.
+  - [x] `11_FactoryProgram/components/externlib/my_button/button.{h,cc}` — debounced
         button wrapper (Espressif `button` component underneath).
-  - [ ] **Explicitly drop**: `port_ft6336.{h,cpp}` (touch — this board has none),
-        `externlib/ui/`, `externlib/ui_res/` (Squareline/LVGL touch UI + fonts — not
-        applicable to a non-interactive, deep-sleep display).
-  - [ ] `12_RTC_Sleep_Test/components/board_power_bsp/board_power_bsp.{h,cpp}` — deep
+  - [x] **Explicitly drop**: `port_ft6336.{h,cpp}` (touch — this board has none),
+        `port_lvgl.{h,cpp}`, `externlib/ui/`, `externlib/ui_res/` (Squareline/LVGL touch UI
+        + fonts — not applicable to a non-interactive, deep-sleep display).
+  - [x] `12_RTC_Sleep_Test/components/board_power_bsp/board_power_bsp.{h,cpp}` — deep
         sleep entry point (`EnableDeepLowPowerMode()`), VBAT rail hold, EXT1 wake mask
-        setup. Adapt rather than copy verbatim: rename to fit our naming, keep the exact
-        sleep/wake sequence (order matters — VBAT hold before `esp_deep_sleep_start()`).
-  - [ ] `waveshare/pcf85063a` component (via `idf_component.yml`, registry) for RTC alarm
+        setup. Copied as-is (sleep/wake sequence order preserved — VBAT hold before
+        `esp_deep_sleep_start()`); note it duplicates `port_power`'s EPD/Audio/VBAT GPIO
+        control on the same three pins — the app-integration step (F3) should pick one
+        API and drop the other rather than keeping both.
+  - [x] `waveshare/pcf85063a` component (via `idf_component.yml`, registry) for RTC alarm
         set/read — used to schedule the next wake at `now + poll_interval_seconds`.
-  - [ ] `idf_component.yml` dependencies (combine both examples' lists):
-        `espressif/button`, `espressif/esp_codec_dev==1.5.4`, `pedrominatel/shtc3^1.4.1`,
-        `waveshare/pcf85063a^1.1.1`.
+        Resolves and builds cleanly; no RTC application code written yet (that's F2).
+  - [x] `idf_component.yml` dependencies: `espressif/button`, `waveshare/pcf85063a^1.1.1`
+        added to `main/idf_component.yml`. `espressif/esp_codec_dev==1.5.4` is already
+        pinned transitively via the vendored `codec_board/idf_component.yml`, so not
+        duplicated. Deliberately **skipped** `pedrominatel/shtc3` — the vendored
+        `port_shtc3.cpp` is a fully self-contained hand-rolled I2C driver that never
+        references that package; the original example's manifest listed it but no source
+        file in `port_bsp` actually calls into it.
 - [ ] **Secrets handling**: `main/secrets.h` (gitignored) defining `BACKEND_BASE_URL` and
       `API_TOKEN` as compile-time constants, matching the spec's "hardcoded, rotated by
       reflashing" model. Commit a `main/secrets.h.example` template with placeholders.
