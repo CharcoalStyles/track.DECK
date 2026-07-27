@@ -432,19 +432,303 @@ static void rtc_schedule_alarm(pcf85063a_dev_t *rtc, int interval_seconds) {
 }
 
 // ---------------------------------------------------------------------
-// E-ink: full refresh only -- no partial-refresh mode is used anywhere
-// (that path was clock-tick-only, and produced audible noise happening
-// once a minute; removed along with the clock). Screen content is blank
-// for now (EPD_Clear() only) -- F4 (rendering real snapshot content:
-// checkins/reminders/calendar/weather) is still future work.
+// Small hand-authored 5x7 bitmap font -- digits, uppercase A-Z (text is
+// upper-cased before drawing), and a bounded set of punctuation actually
+// needed for snapshot content. No text-rendering library exists for this
+// display (EPD_DrawColorPixel is pixel-only, per port_display.h), and
+// this deliberately trades completeness (no lowercase, no full ASCII)
+// for a small, hand-authored/verifiable glyph table.
 // ---------------------------------------------------------------------
 
-static void eink_full_refresh(void) {
+struct font_glyph_t {
+    char ch;
+    uint8_t rows[7];
+};
+
+// clang-format off
+static const font_glyph_t FONT_5X7[] = {
+    {' ', {0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
+    {'0', {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
+    {'1', {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
+    {'2', {0x0E,0x11,0x01,0x0E,0x10,0x10,0x1F}},
+    {'3', {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}},
+    {'4', {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
+    {'5', {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}},
+    {'6', {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}},
+    {'7', {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
+    {'8', {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
+    {'9', {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}},
+    {':', {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00}},
+    {'.', {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}},
+    {',', {0x00,0x00,0x00,0x00,0x00,0x0C,0x08}},
+    {'-', {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
+    {'/', {0x01,0x01,0x02,0x04,0x08,0x10,0x10}},
+    {'%', {0x19,0x1A,0x04,0x04,0x04,0x0B,0x13}},
+    {'?', {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}},
+    {'!', {0x04,0x04,0x04,0x04,0x04,0x00,0x04}},
+    {'\'', {0x0C,0x04,0x08,0x00,0x00,0x00,0x00}},
+    {'A', {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}},
+    {'B', {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}},
+    {'C', {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}},
+    {'D', {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}},
+    {'E', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}},
+    {'F', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}},
+    {'G', {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}},
+    {'H', {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}},
+    {'I', {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}},
+    {'J', {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}},
+    {'K', {0x11,0x12,0x14,0x18,0x14,0x12,0x11}},
+    {'L', {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}},
+    {'M', {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}},
+    {'N', {0x11,0x19,0x15,0x13,0x11,0x11,0x11}},
+    {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
+    {'P', {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
+    {'Q', {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}},
+    {'R', {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}},
+    {'S', {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}},
+    {'T', {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}},
+    {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}},
+    {'V', {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}},
+    {'W', {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}},
+    {'X', {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}},
+    {'Y', {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}},
+    {'Z', {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}},
+};
+// clang-format on
+
+#define FONT_GLYPH_W 5
+#define FONT_GLYPH_H 7
+
+static const uint8_t *font_lookup(char c) {
+    char uc = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    for (size_t i = 0; i < sizeof(FONT_5X7) / sizeof(FONT_5X7[0]); i++) {
+        if (FONT_5X7[i].ch == uc) {
+            return FONT_5X7[i].rows;
+        }
+    }
+    return FONT_5X7[0].rows; // unsupported char -> blank space
+}
+
+// Draws one glyph at (x0,y0) and returns the pixel width to advance by
+// (including a 1-column gap), so callers can chain draw_char() calls.
+static int draw_char(char c, int x0, int y0, int scale, uint8_t color) {
+    const uint8_t *rows = font_lookup(c);
+    for (int row = 0; row < FONT_GLYPH_H; row++) {
+        uint8_t bits = rows[row];
+        for (int col = 0; col < FONT_GLYPH_W; col++) {
+            if (!((bits >> (4 - col)) & 0x1)) {
+                continue;
+            }
+            for (int sy = 0; sy < scale; sy++) {
+                for (int sx = 0; sx < scale; sx++) {
+                    EPD_DrawColorPixel(x0 + col * scale + sx, y0 + row * scale + sy, color);
+                }
+            }
+        }
+    }
+    return (FONT_GLYPH_W + 1) * scale;
+}
+
+// Draws a single line of text, returns the total pixel width drawn.
+static int draw_text(const char *s, int x0, int y0, int scale, uint8_t color) {
+    int x = x0;
+    for (const char *p = s; *p; p++) {
+        x += draw_char(*p, x, y0, scale, color);
+    }
+    return x - x0;
+}
+
+// Greedy word-wrap: draws `text` starting at (x0,y0), breaking at word
+// boundaries to stay within max_width_px, up to max_lines lines: the
+// last line gets "..." appended if text remains beyond it. Returns the
+// y-coordinate just below the last line drawn, for stacking further
+// content underneath.
+static int draw_wrapped_text(const char *text, int x0, int y0, int max_width_px, int scale, uint8_t color, int max_lines) {
+    int char_w = (FONT_GLYPH_W + 1) * scale;
+    int line_h = (FONT_GLYPH_H + 2) * scale;
+    int max_chars_per_line = max_width_px / char_w;
+    if (max_chars_per_line < 1) {
+        max_chars_per_line = 1;
+    }
+
+    size_t len = strlen(text);
+    size_t pos = 0;
+    int y = y0;
+
+    for (int line = 0; pos < len && line < max_lines; line++) {
+        size_t line_len = 0;
+        size_t last_space = 0;
+        bool have_space = false;
+        while (pos + line_len < len && (int)line_len < max_chars_per_line) {
+            if (text[pos + line_len] == ' ') {
+                last_space = line_len;
+                have_space = true;
+            }
+            line_len++;
+        }
+        bool truncated_mid_word = (pos + line_len < len) && text[pos + line_len] != ' ';
+        if (truncated_mid_word && have_space) {
+            line_len = last_space; // break at the last word boundary instead
+        }
+
+        bool more_text_remains = (pos + line_len < len);
+        bool is_last_line = (line == max_lines - 1);
+
+        char line_buf[64];
+        size_t copy_len = line_len < sizeof(line_buf) - 4 ? line_len : sizeof(line_buf) - 4;
+        memcpy(line_buf, text + pos, copy_len);
+        line_buf[copy_len] = '\0';
+        if (is_last_line && more_text_remains) {
+            strcat(line_buf, "...");
+        }
+
+        draw_text(line_buf, x0, y, scale, color);
+        y += line_h;
+        pos += line_len;
+        while (pos < len && text[pos] == ' ') {
+            pos++; // skip the space we broke the line on
+        }
+    }
+    return y;
+}
+
+// ---------------------------------------------------------------------
+// F4 (PROJECT_PLAN.md): render the sync snapshot. A live check-in (spec
+// section 4.3: "the one thing on the display that's actionable") takes
+// over the whole screen; otherwise a compact dashboard (weather +
+// soonest upcoming reminder/calendar event). Battery percentage and
+// local time are always shown in the status bar. Each content section
+// degrades independently per spec section 5 -- a missing/invalid field
+// is just omitted, not flagged as an error on-screen.
+// ---------------------------------------------------------------------
+
+static void draw_status_bar(const sync_snapshot_t &snap, int battery_pct) {
+    char battery_buf[8];
+    snprintf(battery_buf, sizeof(battery_buf), "%d%%", battery_pct);
+    int battery_w = (int)strlen(battery_buf) * (FONT_GLYPH_W + 1) * 2;
+    draw_text(battery_buf, EPD_WIDTH - battery_w - 4, 4, 2, DRIVER_COLOR_BLACK);
+
+    time_t now_epoch = time(nullptr);
+    struct tm local_tm;
+    localtime_r(&now_epoch, &local_tm);
+    char time_buf[6];
+    snprintf(time_buf, sizeof(time_buf), "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
+    draw_text(time_buf, 4, 4, 2, DRIVER_COLOR_BLACK);
+
+    // Centered between time (left) and battery (right) -- always shown
+    // here regardless of whether a check-in or the dashboard follows
+    // below, since it's status-bar-level info either way.
+    if (snap.has_weather) {
+        char temp_buf[8];
+        snprintf(temp_buf, sizeof(temp_buf), "%.0fC", snap.weather.temperature_c);
+        int temp_w = (int)strlen(temp_buf) * (FONT_GLYPH_W + 1) * 2;
+        draw_text(temp_buf, (EPD_WIDTH - temp_w) / 2, 4, 2, DRIVER_COLOR_BLACK);
+    }
+
+    for (int x = 4; x < EPD_WIDTH - 4; x++) {
+        EPD_DrawColorPixel(x, 22, DRIVER_COLOR_BLACK);
+    }
+}
+
+static const sync_checkin_t *find_live_checkin(const sync_snapshot_t &snap) {
+    if (!snap.checkins_valid) {
+        return nullptr;
+    }
+    for (int i = 0; i < snap.checkins_count; i++) {
+        if (snap.checkins[i].has_fired_at) {
+            return &snap.checkins[i];
+        }
+    }
+    return nullptr;
+}
+
+static void draw_checkin(const sync_checkin_t &checkin) {
+    draw_text("CHECK-IN", 8, 30, 2, DRIVER_COLOR_BLACK);
+    // Body text at scale 1 (not 2) -- prompt_text can run to a full
+    // sentence or two, and scale 2 didn't leave enough room to fit it
+    // without truncating. Scale 1 fits ~30 chars/line x 15 lines (450
+    // chars) well over the 256-char field cap, so truncation shouldn't
+    // happen in practice anymore.
+    draw_wrapped_text(checkin.prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
+}
+
+static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
+    time_t t = (time_t)epoch;
+    struct tm local_tm;
+    localtime_r(&t, &local_tm);
+    snprintf(buf, buf_len, "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
+}
+
+static void draw_dashboard(const sync_snapshot_t &snap) {
+    int y = 30;
+
+    if (snap.has_weather) {
+        // Temperature is already in the status bar above -- just cloud
+        // cover here, not repeating it.
+        char buf[16];
+        snprintf(buf, sizeof(buf), "CLOUD %d%%", snap.weather.cloud_cover_pct);
+        draw_text(buf, 8, y, 1, DRIVER_COLOR_BLACK);
+        y += 14;
+    }
+
+    // Soonest upcoming reminder or calendar event, whichever is sooner --
+    // a single combined "next thing" rather than two separate lists,
+    // since there's limited vertical space to spend on it.
+    bool have_next = false;
+    int64_t next_at = 0;
+    char next_label[SYNC_STR_TEXT_LEN] = {0};
+    bool next_is_event = false;
+
+    if (snap.reminders_valid) {
+        for (int i = 0; i < snap.reminders_count; i++) {
+            if (!have_next || snap.reminders[i].due_at < next_at) {
+                have_next = true;
+                next_at = snap.reminders[i].due_at;
+                strncpy(next_label, snap.reminders[i].message, sizeof(next_label) - 1);
+                next_label[sizeof(next_label) - 1] = '\0';
+                next_is_event = false;
+            }
+        }
+    }
+    if (snap.calendar_events_valid) {
+        for (int i = 0; i < snap.calendar_events_count; i++) {
+            if (!have_next || snap.calendar_events[i].start < next_at) {
+                have_next = true;
+                next_at = snap.calendar_events[i].start;
+                strncpy(next_label, snap.calendar_events[i].summary, sizeof(next_label) - 1);
+                next_label[sizeof(next_label) - 1] = '\0';
+                next_is_event = true;
+            }
+        }
+    }
+
+    if (have_next) {
+        char time_buf[6];
+        format_local_hhmm(next_at, time_buf, sizeof(time_buf));
+        char header[24];
+        snprintf(header, sizeof(header), "%s %s:", next_is_event ? "EVENT" : "NEXT", time_buf);
+        draw_text(header, 8, y, 1, DRIVER_COLOR_BLACK);
+        y += 14;
+        draw_wrapped_text(next_label, 8, y, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
+    }
+}
+
+static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
     PortDisplay_Init();
     EPD_Init();
     EPD_Clear();
+
+    draw_status_bar(snap, battery_pct);
+
+    const sync_checkin_t *live_checkin = find_live_checkin(snap);
+    if (live_checkin) {
+        draw_checkin(*live_checkin);
+    } else {
+        draw_dashboard(snap);
+    }
+
     EPD_Display();
-    ESP_LOGI(TAG, "e-ink full refresh done");
+    ESP_LOGI(TAG, "e-ink render done (%s)", live_checkin ? "check-in" : "dashboard");
 }
 
 // ---------------------------------------------------------------------
@@ -573,9 +857,19 @@ extern "C" void app_main(void) {
     BoardAdc_Init();
     float vbat = Get_VbatVoltage();
     int battery_mv = (int)(vbat * 1000.0f + 0.5f);
-    ESP_LOGI(TAG, "battery: %.3fV (%.0f%%)", vbat, (double)Get_Batterylevel());
+    uint8_t battery_pct = Get_Batterylevel();
+    ESP_LOGI(TAG, "battery: %.3fV (%.0f%%)", vbat, (double)battery_pct);
 
     bool wifi_ok = wifi_connect();
+
+    // sync_snapshot_t is ~8.4KB -- far too large for the 3.5KB main task
+    // stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE), so it must live in
+    // heap/PSRAM, not as a stack local. Kept alive (not freed) until
+    // after rendering below -- F4 (PROJECT_PLAN.md) needs the parsed
+    // snapshot to draw real content, not just to extract TZ/RTC/poll
+    // interval as before.
+    sync_snapshot_t *snap = nullptr;
+    bool have_fresh_snapshot = false;
 
     if (wifi_ok) {
         const size_t resp_capacity = 8192;
@@ -589,11 +883,9 @@ extern "C" void app_main(void) {
 
         if (sync_ok) {
             ESP_LOGI(TAG, "/device/sync OK (status %d)", http_status);
-            // sync_snapshot_t is ~8.4KB -- far too large for the 3.5KB
-            // main task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE), so it
-            // must live in heap/PSRAM, not as a stack local.
-            auto *snap = static_cast<sync_snapshot_t *>(heap_caps_malloc(sizeof(sync_snapshot_t), MALLOC_CAP_SPIRAM));
+            snap = static_cast<sync_snapshot_t *>(heap_caps_malloc(sizeof(sync_snapshot_t), MALLOC_CAP_SPIRAM));
             if (sync_snapshot_parse(resp.data, snap)) {
+                have_fresh_snapshot = true;
                 log_snapshot(*snap);
                 if (snap->has_timezone_posix) {
                     strncpy(s_tz_posix, snap->timezone_posix, sizeof(s_tz_posix) - 1);
@@ -615,7 +907,6 @@ extern "C" void app_main(void) {
             } else {
                 ESP_LOGE(TAG, "/device/sync response failed to parse as JSON at all");
             }
-            heap_caps_free(snap);
         } else {
             ESP_LOGE(TAG, "/device/sync failed after retries (last status %d)", http_status);
         }
@@ -634,7 +925,21 @@ extern "C" void app_main(void) {
     Shtc3_ReadTempHumi(&temp_c, &humidity_pct);
     ESP_LOGI(TAG, "SHTC3: temp=%.1fC humidity=%.1f%%", temp_c, humidity_pct);
 
-    eink_full_refresh();
+    // Only redraw the e-ink display when there's fresh data to show it --
+    // e-ink is bistable (holds its image with no power), so skipping the
+    // refresh on a failed cycle naturally leaves the last successful
+    // content on screen instead of blanking it. Matches CLAUDE.md: "a
+    // sync failure or stale display is a degraded UX, never a missed
+    // reminder" -- a stale screen beats an empty one.
+    if (have_fresh_snapshot) {
+        eink_render(*snap, battery_pct);
+    } else {
+        ESP_LOGW(TAG, "skipping e-ink refresh -- no fresh snapshot this cycle, display stays as-is");
+    }
+    if (snap) {
+        heap_caps_free(snap);
+    }
+
     audio_loopback_test();
     sdcard_test();
 

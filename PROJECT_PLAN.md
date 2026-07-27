@@ -445,25 +445,92 @@ consider (not applied yet, just noted for later discussion).
 - **Backend idea**: none — already fully supported as documented.
 
 ### F3. Deep sleep / wake integration
-- [ ] Merge `board_power_bsp`'s sleep sequence into the real cycle: wake → connect → sync
+- [x] Merge `board_power_bsp`'s sleep sequence into the real cycle: wake → connect → sync
       → render → sleep, with `wake_reason`/`reset_reason` correctly attributed each cycle.
-- **Test**: run across many hours/cycles unattended; confirm no brownout/watchdog resets
-  show up in reported `reset_reason`, and RTC-alarm wakes fire reliably at the expected
-  cadence.
+  - **Turned out to already be done**: the linear wake → connect → sync → render → sleep
+        cycle (`app_main`) and correct `wake_reason`/`reset_reason` attribution have been
+        working and hardware-confirmed since Phase 1, and are unchanged by the clock-tick
+        removal (if anything, that removal made the cycle *more* literally "one wake, one
+        full cycle" than it was before). The one genuinely outstanding piece was the
+        duplication flagged back in Phase 0: `board_power_bsp` (vendored from
+        `12_RTC_Sleep_Test`) and `port_bsp`'s `port_power` both drive the same three
+        EPD/Audio/VBAT GPIOs and implement near-identical deep-sleep entry sequences, but
+        only `port_power` was ever actually called from `adhi-firmware.cpp` —
+        `board_power_bsp` wasn't even listed in `main`'s `REQUIRES`, just auto-discovered
+        and compiled in unused. Deleted `components/board_power_bsp` entirely rather than
+        merging anything: `enter_deep_sleep()` already *is* the merged, real sequence,
+        just built on `port_power` instead. `idf.py build` confirms this was truly dead
+        weight — reported binary size (`0x1129e0` bytes) is unchanged from the last build
+        before removal.
+- **Test**: `idf.py build` clean after the removal. The "run across many hours/cycles
+  unattended, confirm no brownout/watchdog resets" half of this is inherently a
+  longer-duration, mostly-passive check rather than something to confirm synchronously —
+  RTC-alarm (timer) wake reliability was already confirmed repeatedly under the old 60s
+  clock-tick cadence (dozens of unattended wakes in a row, see Phase 1's notes); worth a
+  fresh multi-hour soak at the new, longer single-alarm cadence (whatever
+  `poll_interval_seconds` the backend currently has set) to specifically watch for
+  brownout/watchdog `reset_reason` values, next time there's a stretch to just let it run
+  and check back.
 - **Backend idea**: pair with F1's history idea — a Gotify alert (reusing the existing
   `notify_error` path other jobs already use) if `reset_reason` reports
   `brownout`/`watchdog`/`panic` repeatedly, since the spec calls this out as "the only
   visibility into a crash/brownout during the beta without a debugger attached."
 
 ### F4. E-ink rendering of the sync snapshot
-- [ ] Render `checkins`/`reminders`/`calendar_events`/`weather` directly to the 200×200
+- [x] Render `checkins`/`reminders`/`calendar_events`/`weather` directly to the 200×200
       framebuffer (`EPD_DrawColorPixel` + a simple bitmap font) — no LVGL/touch
-      dependency. Partial refresh per sync, full refresh about once daily to clear
-      ghosting.
-- **Test**: visually confirm each field renders; force a malformed/partial backend
-  response and confirm only the affected section is skipped (spec §5's
-  degrade-gracefully requirement) rather than the whole cycle aborting.
-- **Backend idea**: none.
+      dependency.
+  - **Bumped up ahead of F5-F8** at the user's request, alongside adding a battery
+        percentage readout (not in the original checklist wording, folded in here since
+        it's the same status-bar work).
+  - **Deviation from the checklist's "partial refresh per sync, full refresh about once
+        daily"**: unchanged from the clock-tick-removal decision — full refresh
+        (`EPD_Display()`) only, no partial refresh anywhere, since partial refresh is what
+        caused the audible-noise problem that removal fixed. Still refreshing far more
+        often than "once daily" (every `poll_interval_seconds`), which is a known,
+        already-accepted tradeoff from that earlier change, not new here.
+  - **Font**: no text-rendering library exists for this display (`port_display.h` is
+        pixel-only) — hand-authored a small 5x7 bitmap font (`FONT_5X7`) covering digits,
+        uppercase A-Z (text upper-cased before drawing), and a bounded punctuation set,
+        plus `draw_text`/`draw_wrapped_text` (greedy word-wrap with mid-word truncation
+        fallback and a "..." marker) as general-purpose helpers.
+  - **Layout**: status bar (always drawn) shows local time (top-left), current temperature
+        (centered), and battery percentage (top-right, `Get_Batterylevel()`), under a
+        horizontal divider. Below that: a live check-in (`checkins[]` entry with
+        `fired_at` set — spec §4.3's "the one thing on the display that's actionable")
+        takes over the rest of the screen if one exists; otherwise a compact dashboard
+        (cloud cover — temperature already lives in the status bar, so not repeated — plus
+        the single soonest-upcoming item across `reminders[]`/`calendar_events[]`
+        combined, whichever is sooner). Each section degrades independently per spec §5:
+        `has_weather`/`*_valid` false just omits that section, no error shown.
+  - **Real design insight found while wiring this up**: e-ink is bistable (holds its image
+        with no power), so `app_main` now only calls the render function when this cycle
+        actually produced a fresh, successfully-parsed snapshot — a cycle where wifi or
+        sync fails skips the refresh entirely rather than blanking the screen. This gets
+        `CLAUDE.md`'s "a sync failure or stale display is a degraded UX, never a missed
+        reminder" almost for free: a stale-but-intact display beats an empty one, and
+        needed no extra state persistence to achieve (unlike, say, persisting the whole
+        snapshot across deep sleep, which wouldn't fit in the ~8KB RTC slow memory region
+        anyway — `sync_snapshot_t` alone is ~8.4KB).
+- **Test**: hardware-confirmed across several flash/look-at-the-screen iterations (this is
+  fundamentally a visual feature — real verification is looking at the device, not just
+  logs). Confirmed: a genuinely live check-in (`fired_at` set) rendering prominently,
+  correctly *not* showing a merely-scheduled one (`fired_at: null`, verified directly
+  against a live `/debug/device-sync` response) and falling back to the dashboard instead;
+  battery/time/temperature all showing in the status bar; cloud-cover dashboard line.
+  Check-in body text needed a follow-up fix — the initial scale-2 body font didn't leave
+  enough room for a full prompt and was cut off; dropped to scale 1 (~30 chars/line × 15
+  lines, well over the 256-char field cap) and confirmed fixed. Malformed/partial-response
+  degrade-gracefully behavior relies on `sync_snapshot_parse`'s existing per-section
+  `*_valid`/`has_*` flags (already unit-tested in `sync_proto`'s host test suite) rather
+  than a fresh forced-malformed-response hardware test.
+- **Backend idea**: a 3-day hi/low forecast in the dashboard was requested but deferred —
+  `/device/sync`'s `weather` object only carries today's `temperature_min_c`/`_max_c`, not
+  a multi-day array. `adhi-backend/agent/tools/weather.py` already has a
+  `get_weather_forecast()` helper pulling up to 7 days from Open-Meteo, currently only used
+  by the conversational agent — wiring a small 3-entry min/max array from that into
+  `jobs/device_sync.py`'s payload would be the natural way to unlock this without a new
+  external API integration.
 
 ### F5. Telemetry completeness
 - [ ] Wire the real battery-voltage math (`raw_millivolts * 2`) and precise wall-clock
