@@ -4,6 +4,7 @@ idf_component_register(SRCS "adhi-firmware.cpp"
                     port_bsp
                     sync_proto
                     waveshare__pcf85063a
+                    my_button
                     json
                     nvs_flash
                     esp_wifi

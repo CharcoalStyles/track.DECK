@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cmath>
+#include <cstdarg>
 #include <ctime>
 #include <sys/time.h>
 
@@ -27,6 +29,7 @@
 #include <esp_wifi.h>
 #include <esp_http_client.h>
 #include <driver/rtc_io.h>
+#include <driver/gpio.h>
 
 #include "cJSON.h"
 
@@ -40,6 +43,7 @@
 #include "epaper_config.h"
 
 #include "pcf85063a.h"
+#include "button.h"
 
 #include "sync_snapshot.h"
 #include "tz_apply.h"
@@ -116,6 +120,23 @@ static const char *wake_reason_to_string(void) {
         return "button";
     }
     return "power_on";
+}
+
+// F6 (PROJECT_PLAN.md): BOOT is dedicated to push-to-talk, diverging from
+// PWR/RTC-alarm wakes (which still run the normal sync cycle). Checked
+// once at the very top of app_main, before any of the normal-cycle setup,
+// to decide which top-level path to take -- not part of
+// wake_reason_to_string() above, since PTT wakes never call device_sync()
+// and so never need a wake_reason value for the backend at all. If BOOT
+// and RTC_INT both happen to be set (alarm firing at the same instant as
+// a press), PTT wins: a live human interaction should preempt a
+// background sync, which just happens again next interval regardless.
+static bool wake_was_boot_button(void) {
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
+        return false;
+    }
+    uint64_t status = esp_sleep_get_ext1_wakeup_status();
+    return (status & (1ULL << BOOT_BUTTON_PIN)) != 0;
 }
 
 // ---------------------------------------------------------------------
@@ -722,9 +743,27 @@ static void draw_dashboard(const sync_snapshot_t &snap) {
     }
 }
 
+// PortDisplay_Init() unconditionally calls spi_bus_initialize() with
+// ESP_ERROR_CHECK() right after (port_display.cpp) -- calling it twice
+// in the same boot aborts with "SPI bus already initialized" (found via
+// F6 hardware testing: the push-to-talk cycle draws a "RECORDING..."
+// message, then later a "SENT"/"UPLOAD FAILED" one, and the second call
+// crashed the device outright, showing up as reset_reason=panic on the
+// next boot). Shared by every e-ink entry point below so PortDisplay_Init()/
+// EPD_Init() only ever run once per boot, however many times the screen
+// gets updated within that same cycle.
+static bool s_eink_initialized_this_boot = false;
+
+static void eink_ensure_initialized(void) {
+    if (!s_eink_initialized_this_boot) {
+        PortDisplay_Init();
+        EPD_Init();
+        s_eink_initialized_this_boot = true;
+    }
+}
+
 static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
-    PortDisplay_Init();
-    EPD_Init();
+    eink_ensure_initialized();
     EPD_Clear();
 
     draw_status_bar(snap, battery_pct);
@@ -738,6 +777,19 @@ static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
 
     EPD_Display();
     ESP_LOGI(TAG, "e-ink render done (%s)", live_checkin ? "check-in" : "dashboard");
+}
+
+// F6 (PROJECT_PLAN.md): simple full-refresh status message, reusing the
+// same font/wrap helpers as the snapshot render above -- used by the
+// push-to-talk cycle ("RECORDING...", "SENT", "UPLOAD FAILED"), which
+// doesn't have a fresh snapshot to render (it deliberately skips wifi
+// until after recording finishes).
+static void eink_show_message(const char *message) {
+    eink_ensure_initialized();
+    EPD_Clear();
+    draw_wrapped_text(message, 8, 80, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
+    EPD_Display();
+    ESP_LOGI(TAG, "e-ink message shown: %s", message);
 }
 
 // ---------------------------------------------------------------------
@@ -769,11 +821,65 @@ static void audio_loopback_test(void) {
 }
 
 // ---------------------------------------------------------------------
-// SD card: mount, write, read back, verify.
+// SD card: mount, write, read back, verify. Also backs debug logging
+// below -- ensure_sdcard_mounted() is shared so the two don't fight over
+// double-mounting the same card.
 // ---------------------------------------------------------------------
 
+static bool s_sdcard_mounting_in_progress = false;
+static bool s_sdcard_mounted = false;
+
+// Retries on every call until it actually succeeds -- needed because the
+// SD card can't be mounted until BoardPower_VBAT_ON() has powered its
+// rail, but sd_log_vprintf() below (and its early install point in
+// app_main, before power-on) means log calls can arrive before that.
+// s_sdcard_mounting_in_progress guards against reentrancy instead: if
+// Sdcard_Init() itself logs (e.g. a mount failure, via
+// ESP_ERROR_CHECK_WITHOUT_ABORT) and that line re-enters here through
+// sd_log_vprintf(), the reentrant call sees a mount already underway and
+// just reports "not mounted yet" instead of recursing into another
+// attempt.
+static bool ensure_sdcard_mounted(void) {
+    if (s_sdcard_mounted) {
+        return true;
+    }
+    if (s_sdcard_mounting_in_progress) {
+        return false;
+    }
+    s_sdcard_mounting_in_progress = true;
+    s_sdcard_mounted = Sdcard_Init();
+    s_sdcard_mounting_in_progress = false;
+    return s_sdcard_mounted;
+}
+
+// Debugging aid: this board's native USB-Serial/JTAG only stays up while
+// awake, and reconnecting to it mid-test can itself trigger a reset (see
+// PROJECT_PLAN.md's flashing notes) -- so catching a log for a cycle
+// that runs and sleeps again quickly is unreliable over serial alone.
+// Mirrors every ESP_LOG* line to /sdcard/debug.log (append mode) in
+// addition to the normal console output, installed once at the very top
+// of app_main so even the earliest boot lines are captured. Pull the SD
+// card to read it directly, no serial connection needed. Not
+// log-rotated -- fine for a debugging session, would need capping for
+// indefinite/production use.
+static int sd_log_vprintf(const char *fmt, va_list args) {
+    int ret = vprintf(fmt, args);
+
+    if (ensure_sdcard_mounted()) {
+        FILE *f = fopen(SDlist "/debug.log", "a");
+        if (f) {
+            va_list args_copy;
+            va_copy(args_copy, args);
+            vfprintf(f, fmt, args_copy);
+            va_end(args_copy);
+            fclose(f);
+        }
+    }
+    return ret;
+}
+
 static void sdcard_test(void) {
-    if (!Sdcard_Init()) {
+    if (!ensure_sdcard_mounted()) {
         ESP_LOGE(TAG, "SD card mount failed");
         return;
     }
@@ -821,9 +927,329 @@ static void enter_deep_sleep(void) {
 }
 
 // ---------------------------------------------------------------------
+// F6 (PROJECT_PLAN.md): push-to-talk. BOOT wakes the device, recording
+// starts immediately (no wifi yet -- that only happens after recording
+// finishes, right before upload), stops on silence or a second BOOT
+// press or a hard duration cap, then uploads and goes straight back to
+// sleep. Deliberately skips the entire normal sync cycle (wifi-connect
+// beforehand, /device/sync, snapshot render, audio_loopback_test,
+// sdcard_test, RTC-alarm rescheduling) -- spec section 4.2 says a sync
+// afterward is optional, not required, and keeping this path lean keeps
+// the whole interaction fast.
+// ---------------------------------------------------------------------
+
+#define PTT_SAMPLE_RATE_HZ 16000
+#define PTT_CHANNELS 2 // mic hardware is wired stereo (fixed I2S TDM config
+                        // in codec_board); downmixed to mono at upload time.
+#define PTT_BYTES_PER_SAMPLE 2
+#define PTT_CHUNK_MS 200
+#define PTT_MAX_RECORD_MS 60000  // hard safety cap regardless of the two below
+#define PTT_SILENCE_WARMUP_MS 1500 // grace period before silence counts, so
+                                    // the user has a moment to start talking
+#define PTT_SILENCE_STOP_MS 2000   // auto-stop after this much continuous quiet
+// Starting guess, not calibrated against the real mic/room -- likely needs a
+// real-world tuning pass once tested on hardware (see PROJECT_PLAN.md's F6
+// notes). Chunk-level RMS is logged at ESP_LOGD to make that tuning possible
+// without needing to re-instrument anything.
+#define PTT_SILENCE_RMS_THRESHOLD 600
+
+// ---------------------------------------------------------------------
+// WAV header: minimal 44-byte RIFF/WAVE header for 16-bit PCM. No
+// existing WAV-writing code anywhere in this repo or the vendored
+// Waveshare reference tree -- small, fixed-layout, well-documented
+// format, hand-built here rather than pulled in as a dependency.
+// ---------------------------------------------------------------------
+
+#pragma pack(push, 1)
+struct wav_header_t {
+    char riff_tag[4];      // "RIFF"
+    uint32_t riff_length;  // total file length - 8
+    char wave_tag[4];      // "WAVE"
+    char fmt_tag[4];       // "fmt "
+    uint32_t fmt_length;   // 16 for PCM
+    uint16_t audio_format; // 1 = PCM
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate; // sample_rate * num_channels * bits_per_sample/8
+    uint16_t block_align; // num_channels * bits_per_sample/8
+    uint16_t bits_per_sample;
+    char data_tag[4]; // "data"
+    uint32_t data_length; // number of PCM bytes that follow this header
+};
+#pragma pack(pop)
+
+static wav_header_t build_wav_header(uint32_t sample_rate, uint16_t num_channels, uint16_t bits_per_sample, uint32_t data_length) {
+    wav_header_t hdr = {};
+    memcpy(hdr.riff_tag, "RIFF", 4);
+    hdr.riff_length = data_length + (uint32_t)sizeof(wav_header_t) - 8;
+    memcpy(hdr.wave_tag, "WAVE", 4);
+    memcpy(hdr.fmt_tag, "fmt ", 4);
+    hdr.fmt_length = 16;
+    hdr.audio_format = 1;
+    hdr.num_channels = num_channels;
+    hdr.sample_rate = sample_rate;
+    hdr.bits_per_sample = bits_per_sample;
+    hdr.block_align = (uint16_t)(num_channels * (bits_per_sample / 8));
+    hdr.byte_rate = sample_rate * hdr.block_align;
+    memcpy(hdr.data_tag, "data", 4);
+    hdr.data_length = data_length;
+    return hdr;
+}
+
+// Records into buf (capacity max_bytes, stereo/16-bit PCM) in ~200ms
+// chunks, stopping on whichever of three independent conditions fires
+// first: a second BOOT press, ~2s of continuous silence (after an
+// initial warm-up grace period), or the hard 60s cap. Returns the number
+// of bytes actually recorded.
+static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
+    const size_t chunk_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_CHUNK_MS / 1000;
+
+    // Guard against misreading the tail of the original wake-press as an
+    // immediate stop signal: don't construct the button object (which
+    // reconfigures the pin and starts its own debounce state machine)
+    // until the pin genuinely reads released. A normal tap has almost
+    // always already released by this point (boot takes 300-700ms), so
+    // this loop typically exits on its very first check.
+    int waited_ms = 0;
+    while (gpio_get_level(BOOT_BUTTON_PIN) == 0 && waited_ms < 500) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited_ms += 20;
+    }
+
+    // BOOT_BUTTON_PIN was configured as an EXT1 (RTC-domain) wake source
+    // by the *previous* cycle's enter_deep_sleep() call -- this is the
+    // first feature that ever needs it back as a normal digital-matrix
+    // GPIO with real interrupts while awake (every previous use was only
+    // ever a one-shot RTC-domain level read at wake). Release it from
+    // RTC-GPIO mode before iot_button configures it, or its interrupt
+    // registration silently doesn't take effect (found via hardware
+    // testing: OnClick never fired at all without this).
+    rtc_gpio_deinit(BOOT_BUTTON_PIN);
+
+    volatile bool stop_requested = false;
+    Button stop_button(BOOT_BUTTON_PIN, /*active_high=*/false);
+    stop_button.OnClick([&stop_requested]() {
+        ESP_LOGI(TAG, "ptt stop button: click detected");
+        stop_requested = true;
+    });
+
+    size_t recorded_bytes = 0;
+    int elapsed_ms = 0;
+    int silence_ms = 0;
+
+    while (recorded_bytes + chunk_bytes <= max_bytes) {
+        Codec_RecordData(buf + recorded_bytes, chunk_bytes);
+        recorded_bytes += chunk_bytes;
+        elapsed_ms += PTT_CHUNK_MS;
+
+        const int16_t *samples = reinterpret_cast<const int16_t *>(buf + recorded_bytes - chunk_bytes);
+        size_t sample_count = chunk_bytes / sizeof(int16_t);
+        int64_t sum_sq = 0;
+        for (size_t i = 0; i < sample_count; i++) {
+            sum_sq += (int64_t)samples[i] * samples[i];
+        }
+        float rms = sqrtf((float)sum_sq / (float)sample_count);
+        ESP_LOGD(TAG, "ptt chunk rms=%.1f elapsed_ms=%d silence_ms=%d", (double)rms, elapsed_ms, silence_ms);
+
+        if (elapsed_ms > PTT_SILENCE_WARMUP_MS) {
+            silence_ms = (rms < PTT_SILENCE_RMS_THRESHOLD) ? (silence_ms + PTT_CHUNK_MS) : 0;
+        }
+
+        if (stop_requested) {
+            ESP_LOGI(TAG, "ptt recording stopped: button press");
+            break;
+        }
+        if (silence_ms >= PTT_SILENCE_STOP_MS) {
+            ESP_LOGI(TAG, "ptt recording stopped: silence detected");
+            break;
+        }
+        if (elapsed_ms >= PTT_MAX_RECORD_MS) {
+            ESP_LOGW(TAG, "ptt recording stopped: hit max duration cap");
+            break;
+        }
+    }
+
+    return recorded_bytes;
+}
+
+// POST /voice multipart. field name must be exactly "file" (matches
+// adhi-backend/voice.py's `file: UploadFile = File(...)`); never sends
+// one_shot/sync (spec section 3.2 / voice.py's own docstring: testing-only,
+// real hardware must never set them). No built-in multipart helper in
+// esp_http_client -- boundary/headers are hand-built and streamed via
+// open()/write()/fetch_headers() rather than the single-buffer
+// set_post_field() pattern device_sync_attempt() uses, since the body
+// here (WAV header + audio) is too large to comfortably build as one
+// contiguous string first. The stereo capture is downmixed to real mono
+// (average L+R per sample) while streaming, rather than requiring a
+// second full-size buffer -- halves the upload for no quality loss and
+// matches the spec's stated recommendation. No retry loop: unlike
+// /device/sync, voice failures are already designed to be silent/
+// best-effort backend-side (spec's fire-and-forget framing), so one
+// attempt is enough.
+static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes) {
+    const char *boundary = "----adhiVoiceBoundary7f3a";
+
+    char preamble[192];
+    int preamble_len = snprintf(preamble, sizeof(preamble),
+                                 "--%s\r\n"
+                                 "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n"
+                                 "Content-Type: audio/wav\r\n"
+                                 "\r\n",
+                                 boundary);
+
+    char epilogue[64];
+    int epilogue_len = snprintf(epilogue, sizeof(epilogue), "\r\n--%s--\r\n", boundary);
+
+    size_t mono_bytes = stereo_bytes / 2; // same bit depth, half the channels
+    wav_header_t wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, (uint32_t)mono_bytes);
+
+    size_t content_length = (size_t)preamble_len + sizeof(wav_hdr) + mono_bytes + (size_t)epilogue_len;
+
+    char content_type_header[64];
+    snprintf(content_type_header, sizeof(content_type_header), "multipart/form-data; boundary=%s", boundary);
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/voice", BACKEND_BASE_URL);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    // 15s (the original guess) measured genuinely too short on real
+    // hardware: a 384KB mono upload took ~15.9s end to end (observed
+    // effective throughput ~25KB/s over wifi), so the client gave up
+    // waiting for the response right as the backend was finishing --
+    // the file had actually fully arrived and was processed correctly,
+    // this was purely a client-side false-negative timeout. 60s covers
+    // the worst case (the full 60s/1.92MB-mono recording cap) with
+    // headroom; may still need tuning once tested against that case.
+    config.timeout_ms = 60000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "auth", API_TOKEN);
+    esp_http_client_set_header(client, "Content-Type", content_type_header);
+
+    esp_err_t err = esp_http_client_open(client, (int)content_length);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "/voice: failed to open connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    bool write_ok = true;
+    write_ok = write_ok && esp_http_client_write(client, preamble, preamble_len) >= 0;
+    write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(&wav_hdr), sizeof(wav_hdr)) >= 0;
+
+    // Stream the stereo->mono downmix in chunks rather than allocating a
+    // second full-size buffer for it. 4096 frames (8KB/write) cuts
+    // per-call overhead vs. a smaller chunk -- but that buffer must be
+    // heap/PSRAM-allocated, not a stack local: the main task stack is
+    // only 8192 bytes total (see the sync_snapshot_t comment elsewhere
+    // in this file), and an 8KB stack array alone nearly fills it,
+    // which crashed outright on real hardware (silent panic, no error
+    // logged first -- a stack overflow, unlike the SPI-reinit crash
+    // found earlier, which did log before aborting).
+    const int16_t *stereo_samples = reinterpret_cast<const int16_t *>(stereo_pcm);
+    size_t stereo_frame_count = stereo_bytes / (PTT_CHANNELS * sizeof(int16_t));
+    const size_t DOWNMIX_CHUNK_FRAMES = 4096;
+    auto *mono_chunk = static_cast<int16_t *>(heap_caps_malloc(DOWNMIX_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    if (!mono_chunk) {
+        ESP_LOGE(TAG, "/voice: failed to allocate downmix chunk buffer");
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    for (size_t frame = 0; write_ok && frame < stereo_frame_count; frame += DOWNMIX_CHUNK_FRAMES) {
+        size_t this_chunk_frames = (frame + DOWNMIX_CHUNK_FRAMES <= stereo_frame_count) ? DOWNMIX_CHUNK_FRAMES : (stereo_frame_count - frame);
+        for (size_t i = 0; i < this_chunk_frames; i++) {
+            int16_t l = stereo_samples[(frame + i) * 2];
+            int16_t r = stereo_samples[(frame + i) * 2 + 1];
+            mono_chunk[i] = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+        }
+        write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(mono_chunk), (int)(this_chunk_frames * sizeof(int16_t))) >= 0;
+    }
+    heap_caps_free(mono_chunk);
+
+    write_ok = write_ok && esp_http_client_write(client, epilogue, epilogue_len) >= 0;
+
+    if (!write_ok) {
+        ESP_LOGE(TAG, "/voice: write failed mid-upload");
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    bool ok = (status >= 200 && status < 300);
+    ESP_LOGI(TAG, "/voice upload %s (status %d, %u bytes sent)", ok ? "OK" : "FAILED", status, (unsigned)content_length);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ok;
+}
+
+static void run_push_to_talk_cycle(void) {
+    ESP_LOGI(TAG, "push-to-talk: BOOT wake, starting voice cycle");
+
+    BoardPower_Init();
+    BoardPower_VBAT_ON();
+    BoardPower_EPD_ON();
+    BoardPower_Audio_ON();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Codec_StartInit() expects the shared I2C bus already up (the
+    // normal cycle gets this for free via its own RTC/SHTC3 init before
+    // ever touching audio; found missing here via hardware testing --
+    // codec_board logged a harmless-but-confusing "port has not been
+    // initialized" error before self-recovering).
+    I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
+    Codec_StartInit();
+    eink_show_message("RECORDING... PRESS BOOT TO STOP");
+
+    const size_t max_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_MAX_RECORD_MS / 1000;
+    auto *buf = static_cast<uint8_t *>(heap_caps_malloc(max_bytes, MALLOC_CAP_SPIRAM));
+    if (!buf) {
+        ESP_LOGE(TAG, "push-to-talk: failed to allocate %u byte recording buffer", (unsigned)max_bytes);
+        eink_show_message("RECORDING FAILED");
+    } else {
+        size_t recorded_bytes = record_until_stopped(buf, max_bytes);
+        double recorded_seconds = (double)recorded_bytes / (PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE);
+        ESP_LOGI(TAG, "push-to-talk: recorded %u bytes (%.1fs)", (unsigned)recorded_bytes, recorded_seconds);
+
+        // Immediate feedback that the stop (silence or button) actually
+        // registered -- found via hardware testing that wifi connect +
+        // upload can take 20s+, and staying on "RECORDING..." that whole
+        // time looks exactly like the stop didn't work.
+        eink_show_message("SENDING...");
+
+        bool wifi_ok = wifi_connect();
+        bool upload_ok = false;
+        if (wifi_ok) {
+            upload_ok = upload_voice_note(buf, recorded_bytes);
+        } else {
+            ESP_LOGE(TAG, "push-to-talk: skipping upload -- wifi never connected");
+        }
+        eink_show_message(upload_ok ? "SENT" : "UPLOAD FAILED");
+        heap_caps_free(buf);
+    }
+
+    // The regular sync cadence is untouched here -- no
+    // rtc_schedule_alarm() call, the alarm from the last real sync cycle
+    // is left exactly as it was. enter_deep_sleep() already powers down
+    // audio/EPD itself.
+    enter_deep_sleep();
+}
+
+// ---------------------------------------------------------------------
 
 extern "C" void app_main(void) {
     s_boot_time_us = esp_timer_get_time();
+
+    // Installed as early as possible for maximum coverage. Actual
+    // mounting is lazy (first log call after BoardPower_VBAT_ON() powers
+    // the SD rail) and retries on every call until it succeeds -- see
+    // ensure_sdcard_mounted()'s comment.
+    esp_log_set_vprintf(sd_log_vprintf);
 
     // NVS init first, per standard ESP-IDF convention -- required before
     // wifi, and independent of every other subsystem below.
@@ -842,6 +1268,15 @@ extern "C" void app_main(void) {
     const char *reset_reason = reset_reason_to_string(esp_reset_reason());
     const char *wake_reason = wake_reason_to_string();
     ESP_LOGI(TAG, "boot: reset_reason=%s wake_reason=%s", reset_reason, wake_reason);
+
+    // F6: BOOT is dedicated to push-to-talk and takes a completely
+    // separate path -- checked before any of the normal cycle's board
+    // power-on/wifi/sync setup below, since run_push_to_talk_cycle()
+    // does its own power-on and never returns (ends in its own
+    // enter_deep_sleep() call).
+    if (wake_was_boot_button()) {
+        run_push_to_talk_cycle();
+    }
 
     BoardPower_Init();
     BoardPower_VBAT_ON();

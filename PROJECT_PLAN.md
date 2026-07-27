@@ -572,13 +572,67 @@ consider (not applied yet, just noted for later discussion).
 - **Backend idea**: none beyond F1/F3.
 
 ### F6. Push-to-talk voice cycle
-- [ ] Button press (BOOT reused, unless a dedicated free GPIO is preferred) → record via
+- [x] Button press (BOOT reused, unless a dedicated free GPIO is preferred) → record via
       ES8311 (16kHz/mono/16-bit PCM WAV) → `POST /voice` multipart → return to idle
       immediately, no reply wait, ever.
-- **Test**: record a short phrase, confirm an immediate `202` with empty body, then
-  confirm the backend actually processed it via Gotify notification or backend logs
-  (`voice.py`'s background pipeline). Explicitly verify `one_shot`/`sync` form fields are
-  never sent.
+  - **UX refined during this session**: toggle press-to-start/press-to-stop (or silence
+        auto-stop) rather than hold-to-talk — a better fit for the vendored codec driver's
+        `Codec_RecordData()`, which is a single blocking call for a fixed byte count with no
+        "record until told to stop" primitive either way, so a chunked recording loop was
+        needed regardless of which UX was chosen. BOOT is dedicated to this
+        (`wake_was_boot_button()` branches `app_main` into `run_push_to_talk_cycle()` before
+        any of the normal cycle's setup); PWR/RTC-alarm wakes are unaffected. Recording
+        stops on whichever of three conditions fires first: silence (RMS below a threshold
+        for ~2s, after a 1.5s warm-up grace period), a second BOOT press, or a hard 60s cap.
+        Screen shows "RECORDING...", then "SENDING..." the instant a stop is registered
+        (added after hardware testing showed the wifi-connect+upload gap made a successful
+        manual stop look like it hadn't worked), then "SENT"/"UPLOAD FAILED".
+  - **Four real bugs found via hardware testing, all fixed**:
+    1. **Crash: `PortDisplay_Init()` can't run twice per boot.** It unconditionally calls
+       `spi_bus_initialize()` wrapped in `ESP_ERROR_CHECK()` — calling it a second time (once
+       for "RECORDING...", again for "SENT") aborted with "SPI bus already initialized",
+       surfacing as `reset_reason=panic` on the next boot. Fixed with a shared
+       `eink_ensure_initialized()` guard (used by both `eink_render()` and the new
+       `eink_show_message()`) so `PortDisplay_Init()`/`EPD_Init()` only ever run once per
+       boot regardless of how many times the screen updates within that cycle.
+    2. **Stack overflow, self-inflicted.** Bumping the upload's downmix write-chunk size
+       from 1024 to 4096 samples (to reduce per-`esp_http_client_write()` overhead — see
+       bug 3) put an 8KB array on the stack, nearly filling the main task's entire 8192-byte
+       stack on its own. Silent panic, no error logged first (unlike bug 1, which did log
+       before aborting) — confirmed via the SD-card debug log described below. Fixed by
+       heap/PSRAM-allocating that buffer instead, matching the pattern already used
+       elsewhere in this file for audio buffers.
+    3. **Upload timeout too short.** 15s wasn't enough for a real upload (~384KB mono took
+       ~15.9s end to end on real wifi) — the backend actually received and fully processed
+       the file (confirmed via Gotify notification) but the client gave up waiting for the
+       response right as it finished, misreporting success as failure. Bumped to 60s
+       (covers the full 60s/1.92MB-mono worst case with headroom) and increased the write
+       chunk size (contributing to bug 2, now fixed properly).
+    4. **Manual stop button silently did nothing.** `BOOT_BUTTON_PIN` had been configured as
+       an EXT1 (RTC-domain) deep-sleep wake source by the *previous* cycle's
+       `enter_deep_sleep()` — this is the first feature that ever needed it back as a normal
+       interrupt-driven digital GPIO while awake, so this gap was never exercised before.
+       `iot_button`'s GPIO interrupt registration silently didn't take effect while the pin
+       was still in RTC-GPIO mode. Fixed with `rtc_gpio_deinit(BOOT_BUTTON_PIN)` before
+       constructing the `Button` object; confirmed working via a diagnostic log inside
+       `OnClick` in the debug log below.
+  - **New debugging infrastructure, added mid-session**: this board loses its native
+        USB-Serial/JTAG the moment it sleeps, and reconnecting mid-test can itself trigger a
+        reset (a pre-existing caveat from Phase 1) — unworkable for debugging a feature that
+        crashes and reboots within seconds of a normal serial-catchable window. Added
+        `sd_log_vprintf()` (installed via `esp_log_set_vprintf()` at the very top of
+        `app_main`), which mirrors every `ESP_LOG*` line to `/sdcard/debug.log` (append
+        mode) in addition to the console. Pull the card to read it directly, no serial
+        needed — this is exactly how bugs 2 and 4 above were actually diagnosed. Not
+        log-rotated (fine for a debugging session, would need capping for indefinite use).
+- **Test**: hardware-confirmed end to end across several flash/test iterations (see the SD
+  debug log): recorded a real phrase, stopped via silence and separately via a manual
+  second BOOT press, confirmed a `202` and the backend actually processing it (Gotify
+  notification), confirmed `one_shot`/`sync` are never sent (not present in
+  `upload_voice_note()`'s form fields at all), confirmed a PTT cycle doesn't touch the
+  regular sync/RTC-alarm schedule (no `rtc_schedule_alarm()` call in that path). Not yet
+  independently verified: byte-level inspection of an uploaded `.wav` file confirming
+  genuine mono (downmix logic reviewed and believed correct, but not directly inspected).
 - **Backend idea**: none — `voice.py`'s contract already matches the spec precisely.
 
 ### F7. Check-in display + reply/skip flow
