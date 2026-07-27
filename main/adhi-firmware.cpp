@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <ctime>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -57,6 +58,15 @@ static const char *TAG = "bringup";
 // pins) -- from the hardware reference doc's pin table ("RTC alarm/INT
 // line | GPIO5").
 #define RTC_INT_PIN GPIO_NUM_5
+
+// Verbose SD-card mirroring of every ESP_LOG* line to /sdcard/debug.log
+// (see sd_log_vprintf() below). Built as a stopgap for F6/F7 development,
+// when USB-Serial drops on sleep and reconnecting can itself trigger a
+// reset. Costs an SD mount/write per log line, so it's worth being able to
+// turn off for battery-sensitive runs rather than leaving it on forever --
+// flip to 0 to fall back to plain console logging only. reset_history.log
+// (one line per cycle, negligible cost) is unaffected by this flag.
+#define SD_DEBUG_LOG_ENABLED 1
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -956,20 +966,42 @@ static bool ensure_sdcard_mounted(void) {
     return s_sdcard_mounted;
 }
 
+// Caps /sdcard/debug.log at this size before rotating the whole file to
+// /sdcard/debug.log.old (overwriting any previous .old), so a device left
+// running for weeks/months can't fill the card. Checked once per boot
+// rather than per log line -- deep sleep restarts app_main every cycle
+// anyway, so a per-boot check still bounds growth tightly enough without
+// stat()-ing the file on every single log call.
+#define SD_DEBUG_LOG_MAX_BYTES (256 * 1024)
+
+static bool s_debug_log_rotation_checked = false;
+
+static void rotate_debug_log_if_needed(void) {
+    struct stat st;
+    if (stat(SDlist "/debug.log", &st) == 0 && st.st_size > SD_DEBUG_LOG_MAX_BYTES) {
+        remove(SDlist "/debug.log.old");
+        rename(SDlist "/debug.log", SDlist "/debug.log.old");
+    }
+}
+
 // Debugging aid: this board's native USB-Serial/JTAG only stays up while
 // awake, and reconnecting to it mid-test can itself trigger a reset (see
 // PROJECT_PLAN.md's flashing notes) -- so catching a log for a cycle
 // that runs and sleeps again quickly is unreliable over serial alone.
 // Mirrors every ESP_LOG* line to /sdcard/debug.log (append mode) in
 // addition to the normal console output, installed once at the very top
-// of app_main so even the earliest boot lines are captured. Pull the SD
-// card to read it directly, no serial connection needed. Not
-// log-rotated -- fine for a debugging session, would need capping for
-// indefinite/production use.
+// of app_main (gated by SD_DEBUG_LOG_ENABLED) so even the earliest boot
+// lines are captured. Pull the SD card to read it directly, no serial
+// connection needed. Rotated via rotate_debug_log_if_needed() above once
+// per boot, so it stays bounded for indefinite/production use.
 static int sd_log_vprintf(const char *fmt, va_list args) {
     int ret = vprintf(fmt, args);
 
     if (ensure_sdcard_mounted()) {
+        if (!s_debug_log_rotation_checked) {
+            s_debug_log_rotation_checked = true;
+            rotate_debug_log_if_needed();
+        }
         FILE *f = fopen(SDlist "/debug.log", "a");
         if (f) {
             va_list args_copy;
@@ -1571,8 +1603,12 @@ extern "C" void app_main(void) {
     // SD card has no power until BoardPower_VBAT_ON() just ran. Any log
     // line issued before that point would previously have added its own
     // mount-attempt delay before the power latch -- exactly the kind of
-    // self-inflicted delay this whole reordering is fixing.
+    // self-inflicted delay this whole reordering is fixing. Gated by
+    // SD_DEBUG_LOG_ENABLED: when off, logging falls back to plain console
+    // output only, skipping the SD mount/write cost per log line entirely.
+#if SD_DEBUG_LOG_ENABLED
     esp_log_set_vprintf(sd_log_vprintf);
+#endif
 
     // NVS init, per standard ESP-IDF convention -- required before wifi,
     // and independent of every other subsystem below.
