@@ -982,6 +982,33 @@ static int sd_log_vprintf(const char *fmt, va_list args) {
     return ret;
 }
 
+// F3/F8 soak test: a dedicated, pre-filtered log separate from the
+// verbose debug.log above -- one compact line per normal-cycle wake,
+// just the reset/wake cause and battery level, so a multi-hour
+// unattended run can be reviewed directly (no grep needed) for both
+// brownout/watchdog resets and overnight battery drain. UTC, not local
+// time: this runs before sync_tz_apply() applies each cycle's timezone,
+// so local time isn't reliably known yet this early -- the RTC's own
+// system time (persisted across deep sleep, corrected each successful
+// sync) is still meaningful even so, just not yet TZ-adjusted.
+static void log_reset_history(const char *reset_reason, const char *wake_reason, float vbat, int battery_pct) {
+    if (!ensure_sdcard_mounted()) {
+        return;
+    }
+    FILE *f = fopen(SDlist "/reset_history.log", "a");
+    if (!f) {
+        return;
+    }
+    time_t now = time(nullptr);
+    struct tm utc_tm;
+    gmtime_r(&now, &utc_tm);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d UTC reset_reason=%s wake_reason=%s battery=%.3fV(%d%%)\n",
+            utc_tm.tm_year + 1900, utc_tm.tm_mon + 1, utc_tm.tm_mday,
+            utc_tm.tm_hour, utc_tm.tm_min, utc_tm.tm_sec,
+            reset_reason, wake_reason, (double)vbat, battery_pct);
+    fclose(f);
+}
+
 static void sdcard_test(void) {
     if (!ensure_sdcard_mounted()) {
         ESP_LOGE(TAG, "SD card mount failed");
@@ -1603,6 +1630,7 @@ extern "C" void app_main(void) {
     int battery_mv = (int)(vbat * 1000.0f + 0.5f);
     uint8_t battery_pct = Get_Batterylevel();
     ESP_LOGI(TAG, "battery: %.3fV (%.0f%%)", vbat, (double)battery_pct);
+    log_reset_history(reset_reason, wake_reason, vbat, battery_pct);
 
     bool wifi_ok = wifi_connect();
 
