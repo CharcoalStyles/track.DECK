@@ -537,13 +537,6 @@ consider (not applied yet, just noted for later discussion).
   degrade-gracefully behavior relies on `sync_snapshot_parse`'s existing per-section
   `*_valid`/`has_*` flags (already unit-tested in `sync_proto`'s host test suite) rather
   than a fresh forced-malformed-response hardware test.
-- **Backend idea**: a 3-day hi/low forecast in the dashboard was requested but deferred —
-  `/device/sync`'s `weather` object only carries today's `temperature_min_c`/`_max_c`, not
-  a multi-day array. `adhi-backend/agent/tools/weather.py` already has a
-  `get_weather_forecast()` helper pulling up to 7 days from Open-Meteo, currently only used
-  by the conversational agent — wiring a small 3-entry min/max array from that into
-  `jobs/device_sync.py`'s payload would be the natural way to unlock this without a new
-  external API integration.
 
 ### F5. Telemetry completeness
 - [x] Wire the real battery-voltage math (`raw_millivolts * 2`) and precise wall-clock
@@ -579,8 +572,12 @@ consider (not applied yet, just noted for later discussion).
   round-trip, not low-hundreds-of-ms. This is exactly the kind of number the spec calls out
   as validating/refuting the battery-life estimate, so worth carrying forward accurately
   rather than leaving the stale expectation in place. `battery_mv` cross-check against a
-  multimeter is a manual hardware step outside what could be verified in this session —
-  left undone, but the math is confirmed sound by inspection above.
+  multimeter is a manual hardware step outside what could be verified in this session.
+  **Superseded (2026-07-28)**: user judged the F3/F8 overnight soak test's real-world
+  drain (98%→89% over ~8h48m, no push-to-talk recording during the window) close enough
+  to expectations that a separate multimeter cross-check isn't needed — recording/upload
+  would only add draw on top of this baseline, so the observed number is a reasonable
+  floor, not a contradiction of the estimate.
 - **Backend idea**: none beyond F1/F3.
 
 ### F6. Push-to-talk voice cycle
@@ -659,9 +656,12 @@ consider (not applied yet, just noted for later discussion).
   notification), confirmed `one_shot`/`sync` are never sent (not present in
   `upload_voice_note()`'s form fields at all), confirmed a PTT cycle doesn't touch the
   regular sync/RTC-alarm schedule (no `rtc_schedule_alarm()` call in that path), confirmed
-  the post-PTT screen restore described above. Not yet independently verified: byte-level
+  the post-PTT screen restore described above. Not independently verified: byte-level
   inspection of an uploaded `.wav` file confirming genuine mono (downmix logic reviewed and
-  believed correct, but not directly inspected).
+  believed correct, but not directly inspected). **Closed as unnecessary (2026-07-28)**:
+  per the user, mono isn't actually a requirement for this to work — the backend
+  transcribes successfully either way — so whether the downmix is byte-perfect doesn't
+  matter in practice. Not worth spending time verifying.
 - **Backend idea**: none — `voice.py`'s contract already matches the spec precisely.
 
 ### F7. Check-in display + reply/skip flow
@@ -716,7 +716,10 @@ consider (not applied yet, just noted for later discussion).
         and the F7 check-in-skip path all funnel through this same function, so there's no
         path that leaves either rail powered into sleep. Actual current-draw drop is a
         manual multimeter check, not something verifiable from this session (same caveat as
-        F5's `battery_mv` cross-check) — left for the user to confirm.
+        F5's `battery_mv` cross-check). **Superseded (2026-07-28)**: user judged the
+        overnight soak test's observed ~1%/hour drain (no recording during the window)
+        close enough to the battery-life estimate that a separate multimeter check isn't
+        needed — deferred indefinitely rather than left as an open action item.
   - **Real gap found and fixed**: a failed sync cycle previously just logged a warning and
         left the display completely untouched — correct per CLAUDE.md's "a sync failure or
         stale display is a degraded UX, never a missed reminder," but that line is about not
@@ -757,8 +760,10 @@ consider (not applied yet, just noted for later discussion).
   clean over the actual overnight run: 98%→89% battery drop (4.104V→3.998V) across
   ~8h48m, roughly 1%/hour, extrapolating to a very rough ~4-day full-charge estimate
   (non-linear discharge curve, so treat as an order-of-magnitude sanity check, not a
-  precise runtime figure) — a real number to eventually cross-check against a manual
-  multimeter current-draw measurement, per this section's earlier note.
+  precise runtime figure). Per this section's earlier note, the user judged this close
+  enough to the battery-life estimate (with no push-to-talk recording during the window,
+  so real-world draw would only be higher) that the separate manual multimeter
+  cross-check is no longer needed.
 
 **Explicit non-goals throughout** (already agreed in `CLAUDE.md`): no OTA, no
 multi-device/fleet concept, no offline queueing/delta sync, no synthesized TTS reply.
