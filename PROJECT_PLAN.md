@@ -390,8 +390,9 @@ consider (not applied yet, just noted for later discussion).
   - `/device/sync OK (status 200)` with a full real snapshot parsed (live check-in,
     weather, TZ, poll_interval_seconds all present and logged) — confirms battery_mv
     reached the backend as part of a normal request (not separately re-verified against
-    `GET /debug/device-state`, which is source-IP-restricted and wasn't reachable from
-    this shell — the serial-side confirmation is sufficient).
+    `GET /debug/device-state` at the time — that curl attempt failed for a mundane reason
+    later found in F5: a missing `auth` header, not an actual restriction. The serial-side
+    confirmation was sufficient here regardless).
   - Rest of the cycle (RTC set, SHTC3 read, e-ink refresh, audio loopback) completed
     normally afterward, unaffected by the F1 changes.
 - **Backend idea**: `utils/device_state.py` currently appears to store only the *latest*
@@ -533,10 +534,41 @@ consider (not applied yet, just noted for later discussion).
   external API integration.
 
 ### F5. Telemetry completeness
-- [ ] Wire the real battery-voltage math (`raw_millivolts * 2`) and precise wall-clock
+- [x] Wire the real battery-voltage math (`raw_millivolts * 2`) and precise wall-clock
       `time_awake_ms` (wake-to-response) into the sync body.
-- **Test**: cross-check `battery_mv` against a multimeter once; confirm `time_awake_ms`
-  stays in the low-hundreds-of-ms range expected for the battery-life goal.
+  - **Battery-voltage math was already done**: `port_adc.cpp`'s `Get_VbatVoltage()`
+        (vendored Waveshare driver, Phase 0) already applies the ×2 divider correction
+        internally (`VbatVoltage = 0.001 * CalibratedData * 2`) — confirmed genuinely
+        correct, not just present, since every logged voltage across this whole project
+        (4.11-4.14V) is exactly right for a full single-cell LiPo; without the ×2 it would
+        read roughly half that. No firmware change needed here.
+  - [x] **Real bug found and fixed**: `time_awake_ms` was computed at the very top of
+        `device_sync()`, *before* the HTTP call it's embedded in even happens — so it
+        measured "wake to start of the first sync attempt," excluding the actual network
+        round-trip and any retries entirely, directly contradicting spec section 4.1's "the
+        number that validates or refutes the battery-life estimate this project is being
+        built around." Fixed per the spec's own suggested alternative ("track it locally
+        and report on the next call"): `s_last_cycle_time_awake_ms` (`RTC_DATA_ATTR`,
+        starts at 0 for the very first boot) is measured *after* the sync attempt concludes
+        (success, retries-exhausted, or wifi never connecting), and reported as
+        `time_awake_ms` on the *next* cycle's sync call — `device_sync()` now takes it as a
+        parameter instead of computing it internally.
+- **Test**: `idf.py build` clean. Hardware-confirmed across a real deep-sleep boundary via
+  `GET /debug/device-state` (this shell's earlier "source-IP-restricted" read on this
+  endpoint, back in F1, was actually just a missing `auth` header, not an IP restriction —
+  corrected that assumption here): first cycle after reflash correctly reported
+  `time_awake_ms: 0` (accurate — no prior cycle exists yet); the next cycle, a genuine
+  `wake_reason: "timer"` / `reset_reason: "deep_sleep_wake"` RTC-alarm wake (not a manual
+  reset), correctly reported `time_awake_ms: 11023` — the value measured and persisted
+  from the previous cycle, carried correctly across the deep-sleep boundary via
+  `RTC_DATA_ATTR`. **Correction to this checklist's own "low-hundreds-of-ms" expectation**:
+  that was aspirational, not measured — the real wake-to-sync-response time is ~11 seconds,
+  dominated by wifi connect (scan + associate + DHCP, several seconds) plus the backend
+  round-trip, not low-hundreds-of-ms. This is exactly the kind of number the spec calls out
+  as validating/refuting the battery-life estimate, so worth carrying forward accurately
+  rather than leaving the stale expectation in place. `battery_mv` cross-check against a
+  multimeter is a manual hardware step outside what could be verified in this session —
+  left undone, but the math is confirmed sound by inspection above.
 - **Backend idea**: none beyond F1/F3.
 
 ### F6. Push-to-talk voice cycle

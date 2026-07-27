@@ -80,6 +80,14 @@ static int64_t s_boot_time_us;
 static RTC_DATA_ATTR char s_tz_posix[64] = "UTC0";
 static RTC_DATA_ATTR int s_last_known_good_poll_interval = FALLBACK_POLL_INTERVAL_SECONDS;
 static RTC_DATA_ATTR bool s_has_synced_ever = false;
+// F5 (PROJECT_PLAN.md): spec section 4.1 wants time_awake_ms measured from
+// wake to the moment the /device/sync response is received -- which can't
+// be known *before* sending the very request that reports it. Per the
+// spec's own suggested alternative ("track it locally and report on the
+// next call"), this holds the *previous* cycle's measured awake duration,
+// reported on the current cycle's sync call. Starts at 0 for the very
+// first-ever boot, which is accurate (there was no prior cycle).
+static RTC_DATA_ATTR int64_t s_last_cycle_time_awake_ms = 0;
 
 // ---------------------------------------------------------------------
 // Reset reason / wake reason (spec section 3.1's field table)
@@ -332,9 +340,10 @@ static bool device_sync_attempt(const char *request_body, http_response_buf_t *r
 // Bounded retry with backoff per spec section 5. F1 (PROJECT_PLAN.md):
 // full real telemetry, including battery_mv (caller reads the ADC before
 // wifi connects, since sync needs it in the request body up front).
-static bool device_sync(const char *wake_reason, const char *reset_reason, int battery_mv, http_response_buf_t *resp, int *out_status) {
-    int64_t time_awake_ms = (esp_timer_get_time() - s_boot_time_us) / 1000;
-
+// time_awake_ms is the *previous* cycle's measured awake duration (see
+// s_last_cycle_time_awake_ms) -- it can't be this cycle's own duration,
+// since that isn't known until after this very request completes.
+static bool device_sync(const char *wake_reason, const char *reset_reason, int battery_mv, int64_t time_awake_ms, http_response_buf_t *resp, int *out_status) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "wake_reason", wake_reason);
     cJSON_AddStringToObject(root, "firmware_version", "0.2.0-f1");
@@ -879,7 +888,8 @@ extern "C" void app_main(void) {
         resp.written = 0;
 
         int http_status = 0;
-        bool sync_ok = device_sync(wake_reason, reset_reason, battery_mv, &resp, &http_status);
+        ESP_LOGI(TAG, "reporting time_awake_ms=%lld (measured last cycle)", (long long)s_last_cycle_time_awake_ms);
+        bool sync_ok = device_sync(wake_reason, reset_reason, battery_mv, s_last_cycle_time_awake_ms, &resp, &http_status);
 
         if (sync_ok) {
             ESP_LOGI(TAG, "/device/sync OK (status %d)", http_status);
@@ -920,6 +930,14 @@ extern "C" void app_main(void) {
     // *last successful* sync's poll_interval_seconds used as the sleep
     // duration when this cycle fails, not the hardcoded fallback, as
     // long as one has ever succeeded.
+
+    // F5: this cycle's actual wake-to-sync-response duration, measured
+    // now that the sync attempt (success, retries-exhausted, or wifi
+    // never connecting at all) has concluded -- stored for *next*
+    // cycle's sync call to report, per the comment on
+    // s_last_cycle_time_awake_ms's declaration above.
+    s_last_cycle_time_awake_ms = (esp_timer_get_time() - s_boot_time_us) / 1000;
+    ESP_LOGI(TAG, "this cycle's wake-to-sync-response time: %lldms", (long long)s_last_cycle_time_awake_ms);
 
     float temp_c = 0, humidity_pct = 0;
     Shtc3_ReadTempHumi(&temp_c, &humidity_pct);
