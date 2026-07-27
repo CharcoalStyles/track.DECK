@@ -472,11 +472,18 @@ consider (not applied yet, just noted for later discussion).
   unattended, confirm no brownout/watchdog resets" half of this is inherently a
   longer-duration, mostly-passive check rather than something to confirm synchronously —
   RTC-alarm (timer) wake reliability was already confirmed repeatedly under the old 60s
-  clock-tick cadence (dozens of unattended wakes in a row, see Phase 1's notes); worth a
-  fresh multi-hour soak at the new, longer single-alarm cadence (whatever
-  `poll_interval_seconds` the backend currently has set) to specifically watch for
-  brownout/watchdog `reset_reason` values, next time there's a stretch to just let it run
-  and check back.
+  clock-tick cadence (dozens of unattended wakes in a row, see Phase 1's notes).
+  - **Confirmed clean (2026-07-27 overnight, on battery)**: ran unattended from
+        2026-07-27 13:50:16 to 22:38:42 UTC, ~8h48m, via the dedicated
+        `/sdcard/reset_history.log` built for exactly this purpose (see F8's section
+        below). ~101 wake cycles at the real `poll_interval_seconds=300` (5min) cadence —
+        every single inter-wake gap fell between 5:09 and 5:14, no drift, no outliers, no
+        missed/skipped cycles. Every `reset_reason` across the entire run was a normal
+        `deep_sleep_wake` (one initial `power_on` at the very start of the log) — zero
+        occurrences of `brownout`, `watchdog`, or `panic`. This closes out the last
+        genuinely open item from F3/F8; wake-scheduling and power stability are now
+        hardware-confirmed over a realistic multi-hour on-battery run, not just
+        synchronously for a handful of cycles.
 - **Backend idea**: pair with F1's history idea — a Gotify alert (reusing the existing
   `notify_error` path other jobs already use) if `reset_reason` reports
   `brownout`/`watchdog`/`panic` repeatedly, since the spec calls this out as "the only
@@ -742,6 +749,16 @@ consider (not applied yet, just noted for later discussion).
 - **Backend idea**: a second, distinct alert alongside F3's — "no successful sync in over
   `poll_interval_seconds * 3`" — since a silently-dead/offline device and a noisy
   crash-loop are different failure signatures worth telling apart.
+- **Soak-test tooling added (2026-07-27)**: `log_reset_history()` writes one compact,
+  timestamped line per normal-cycle wake to a new `/sdcard/reset_history.log` (separate
+  from the existing verbose `debug.log`) — `reset_reason`, `wake_reason`, and battery
+  voltage/percent, in UTC. Built specifically to make the F3 multi-hour soak test (above)
+  reviewable without grepping thousands of lines of wifi/HTTP debug output. Confirmed
+  clean over the actual overnight run: 98%→89% battery drop (4.104V→3.998V) across
+  ~8h48m, roughly 1%/hour, extrapolating to a very rough ~4-day full-charge estimate
+  (non-linear discharge curve, so treat as an order-of-magnitude sanity check, not a
+  precise runtime figure) — a real number to eventually cross-check against a manual
+  multimeter current-draw measurement, per this section's earlier note.
 
 **Explicit non-goals throughout** (already agreed in `CLAUDE.md`): no OTA, no
 multi-device/fleet concept, no offline queueing/delta sync, no synthesized TTS reply.
