@@ -290,6 +290,56 @@ font/text-rendering library existed before this.
   heavily-contrasted content after repeated partial refreshes) — replaced with a plain
   white background for the real clock content.
 
+### Clock-tick wake scheme: removed (2026-07-28)
+
+The 60s partial-refresh wake scheme above turned out to produce audible noise from the
+SSD1681 once a minute, all day — a real problem for what's meant to be a quiet bedside/desk
+device. Removed entirely (`FONT_5X7`, `draw_glyph`/`draw_clock`, `eink_clock_tick`, the
+`s_wake_tick_count`/`s_ticks_per_sync`/`s_epd_seeded` `RTC_DATA_ATTR` state, and the
+`is_sync_wake` branching in `app_main`) rather than just reducing its frequency, since the
+whole tick-wake architecture existed solely to serve the clock.
+
+Wake scheduling reverted to the literal spec design (`ESP32_FIRMWARE_SPEC.md` §4.1): one
+wake = one full sync cycle, RTC alarm set directly to `now + poll_interval_seconds`
+(`rtc_schedule_alarm()` takes back its `interval_seconds` parameter, matching the
+pre-clock-tick `ab5ab59` version). This is a net simplification, not just a feature cut:
+
+- No more partial refreshes anywhere — `eink_full_seed_with_clock()` → `eink_full_refresh()`,
+  a plain `EPD_Display()` full refresh once per cycle (screen content is blank for now;
+  F4 still owns rendering real snapshot content).
+- `poll_interval_seconds` is now honored exactly (down to the second) instead of rounded to
+  the nearest 60s tick — strictly more precise than F2's tick-rounding fix below, which is
+  now superseded and removed (see F2's entry).
+- The EPD is power-gated off between wakes again (`BoardPower_EPD_OFF()` in
+  `enter_deep_sleep()`, no more `EPD_PWR_PIN` hold) — it only needed to stay powered to
+  preserve the SSD1681's partial-refresh baseline across quiet ticks, which no longer exist.
+- **Bonus fix while rebuilding this path**: spec §5 says a failed sync should fall back to
+  sleeping for the *last-known-good* `poll_interval_seconds`, cached from the most recent
+  successful sync — but neither this scheme nor the original pre-clock code actually
+  persisted that value *across* deep-sleep cycles (a fresh boot after a failure always fell
+  back to the hardcoded default, even if the previous cycle had a perfectly good cached
+  value). Fixed by persisting `s_last_known_good_poll_interval`/`s_has_synced_ever` in
+  `RTC_DATA_ATTR` and using `sync_effective_poll_interval()` (`sync_backoff.c`) — written
+  and unit-tested since Phase 0, but never actually wired into the firmware until now.
+
+Not in scope for this change: `audio_loopback_test()` also runs unconditionally every sync
+cycle and is audibly noisy in its own right (records 3s, plays it back through the
+speaker). The complaint that triggered this removal was specifically about the e-ink
+partial refresh, so this is left as-is — worth revisiting in F8 (robustness/power-safety
+pass).
+
+**Verification status**: `idf.py build` clean, host Catch2 suite back to 78 assertions / 20
+cases (confirms removing `sync_poll_interval_to_ticks` didn't break anything else).
+Flashed and confirmed on real hardware (via direct physical observation, since this
+session's shell lost USB passthrough to the board partway through — `lsusb` never showed
+the device again after that point, unrelated to the code itself): screen is blank on wake
+(no more clock, as expected — F4 still owns real content) and a button-triggered wake runs
+the full cycle (e-ink refresh, mic/speaker loopback) with no per-minute activity in
+between. Serial-level confirmation of the exact alarm-interval log line
+(`"RTC alarm scheduled at HH:MM:SS UTC (+Ns)"`) is still outstanding — worth a quick check
+next time serial access is available, but not blocking given the physical behavior already
+confirms the tick scheme is gone.
+
 ---
 
 ## Phase 2 — Feature roadmap
@@ -300,14 +350,50 @@ tested, and — where grounded in the actual backend code — a possible backend
 consider (not applied yet, just noted for later discussion).
 
 ### F1. Sync networking core (wifi + auth + retry/backoff)
-- [ ] Persist wifi credentials in NVS; send real telemetry (`battery_mv`, `wake_reason`,
-      `firmware_version`, `rssi_dbm`, `time_awake_ms`, `reset_reason`) on
-      `POST /device/sync`; parse the full response via the `sync_proto` component; bounded
-      retry (2-3 attempts) with backoff on failure per spec §5.
-- **Test**: trigger a sync via button press, compare parsed fields against
-  `GET /debug/device-sync`'s preview payload (`adhi-backend/main.py:583` — returns the
-  exact shape `/device/sync` would send, without recording telemetry). Host-based Unity
-  tests cover the backoff state machine and JSON parsing directly.
+- [x] Send real telemetry (`battery_mv`, `wake_reason`, `firmware_version`, `rssi_dbm`,
+      `time_awake_ms`, `reset_reason`) on `POST /device/sync`; parse the full response via
+      the `sync_proto` component; bounded retry (2-3 attempts) with backoff on failure per
+      spec §5. All of this was already substantially in place from the Phase 1 bring-up
+      test (`sync_backoff` bounded at `SYNC_BACKOFF_MAX_ATTEMPTS=3`, full response parsed
+      via `sync_snapshot_parse`) — F1's actual remaining work was wiring `battery_mv` into
+      the request body itself (previously only read/logged *after* the sync call; moved
+      the ADC read earlier in `adhi-firmware.cpp` so it's available when the JSON body is
+      built) and the wifi rework below.
+  - [x] **Revised from the original checklist wording**: skip persisting wifi credentials
+        to NVS. `CLAUDE.md`'s model for this device is "hardcoded, rotated only by
+        reflashing" (matching `API_TOKEN`) — there's no product reason to decouple wifi
+        creds from compile-time constants the way a multi-user provisioning flow would
+        need. Instead, `secrets.h` now holds an array (`WIFI_NETWORKS[]`, at least one
+        entry) instead of a single SSID/password pair, still compiled in.
+  - [x] **Scan-then-match instead of one hardcoded SSID**: `wifi_connect()` now calls
+        `wifi_scan_and_select()` first — one active scan (`esp_wifi_scan_start`, blocking,
+        ~1-3s), matched against `WIFI_NETWORKS[]`, connecting to whichever known network
+        has the strongest visible RSSI. Falls back to the first configured entry blind
+        only if nothing in the scan matched (covers hidden SSIDs). Deliberately *not* a
+        serial try-each-network-with-a-timeout approach — that would multiply worst-case
+        wake time by however many networks are configured, against the `time_awake_ms`
+        battery-life budget the spec cares about; one scan is a fixed small cost
+        regardless of list length. Removed the old `WIFI_EVENT_STA_START` auto-connect
+        handler since the initial connect is now issued explicitly, after scan+select,
+        not blind on driver start.
+- **Test**: `idf.py build` clean, flashed to the real board (`idf.py -p /dev/ttyACM0
+  flash`), confirmed over serial:
+  - `battery: 4.120V (99%)` logged *before* the wifi scan/connect — confirms the ADC read
+    now happens early enough to land in the sync request body, not just after it.
+  - `wifi scan: selected known SSID "Babys First Wifi" (rssi -54, 11 APs seen)` — scan-
+    then-match picked the known network correctly out of 11 visible APs on the first real
+    multi-AP scan this firmware has ever done.
+  - One `wifi disconnected, retry` cycle occurred (AP responded "Association refused
+    temporarily" — normal 802.11 SAE/assoc backoff, not a bug) and the existing
+    disconnect-retry handler recovered on its own within ~3s, connecting on the next
+    attempt.
+  - `/device/sync OK (status 200)` with a full real snapshot parsed (live check-in,
+    weather, TZ, poll_interval_seconds all present and logged) — confirms battery_mv
+    reached the backend as part of a normal request (not separately re-verified against
+    `GET /debug/device-state`, which is source-IP-restricted and wasn't reachable from
+    this shell — the serial-side confirmation is sufficient).
+  - Rest of the cycle (RTC set, SHTC3 read, e-ink refresh, audio loopback) completed
+    normally afterward, unaffected by the F1 changes.
 - **Backend idea**: `utils/device_state.py` currently appears to store only the *latest*
   sync's telemetry (`record_sync` overwrites, `GET /debug/device-state` returns one row) —
   consider a small rolling history (last N syncs) so `battery_mv`/`time_awake_ms` trends
@@ -316,11 +402,46 @@ consider (not applied yet, just noted for later discussion).
   single latest value can't show a trend, only a history can.
 
 ### F2. RTC time correction + POSIX TZ + wake scheduling
-- [ ] Apply `now`/`timezone.posix` every sync; set the next RTC alarm at
-      `now + poll_interval_seconds` from the freshest response, never a stale/cached value.
-- **Test**: change `device_poll_interval_seconds` via the backend's settings endpoint
-  (`main.py`, field defined ~line 388, applied ~line 464) mid-testing and confirm the
-  device's next wake timing follows the new value on its very next sync.
+- [x] Apply `now`/`timezone.posix` every sync; honor the freshest `poll_interval_seconds`
+      from the response, never a stale/cached value.
+  - **Architecture note**: this was already substantially done by the clock-tick wake
+        scheme built on top of Phase 1 — the device wakes every ~60s regardless (RTC alarm
+        always set to the next whole-minute boundary, for the on-screen clock), and only
+        every `s_ticks_per_sync`'th wake does a real sync. That's a deliberate divergence
+        from the checklist's literal "set the next RTC alarm at `now + poll_interval_seconds`"
+        wording — a single long alarm would kill the clock display — but achieves the same
+        effect: sync cadence tracks the server's freshest `poll_interval_seconds`, applied
+        fresh on every successful sync, never hardcoded or left stale.
+  - [x] **Real bug found and fixed**: `s_ticks_per_sync` was computed as
+        `poll_interval_seconds / 60` (integer division, i.e. floored) — for any
+        `poll_interval_seconds` that isn't an exact multiple of 60 (the backend's own
+        validator allows 30-86400, not just round minutes — see
+        `adhi-backend/main.py`'s `is_valid_poll_interval_seconds`), this synced *more*
+        often than the server actually asked for (e.g. 90s would floor to 1 tick = 60s
+        instead of ~90s). Fixed by adding `sync_poll_interval_to_ticks()` to
+        `components/sync_proto/sync_backoff.{h,c}` — rounds to the *nearest* tick instead
+        of flooring, still clamped to a minimum of 1 tick (60s is the smallest schedulable
+        unit in this architecture, so anything below that can't be honored more precisely).
+        Covered by 4 new host-side Catch2 test cases (exact multiples, round-to-nearest
+        including a tie, and the never-below-1 floor) — 88 assertions / 23 cases total now
+        pass, up from 78/20.
+  - **Superseded (2026-07-28)**: the clock-tick wake scheme this rounding fix belonged to
+        was removed entirely (see the note after Phase 1's "Clock-tick wake scheme"
+        section) due to audible partial-refresh noise. `sync_poll_interval_to_ticks()` and
+        its tests were deleted along with it — wake scheduling reverted to a single alarm
+        at `now + poll_interval_seconds`, which honors the server's value exactly rather
+        than rounding to a 60s tick, making this fix's whole premise moot. Test suite is
+        back to 78 assertions / 20 cases as a result.
+- **Test**: `idf.py build` clean; host Catch2 suite passes (88 assertions/23 cases,
+  including the new tick-rounding tests). Flashed to real hardware and confirmed over
+  serial: TZ applied (`AEST-10AEDT,M10.1.0,M4.1.0/3`), RTC set from server `now`
+  (`2026-07-27 04:09:20` UTC), `poll_interval_seconds=300` received and parsed. **Not
+  independently reproduced live** for a non-multiple-of-60 `poll_interval_seconds` (would
+  require temporarily changing the backend's setting and observing tick timing across
+  several more wake cycles — skipped for now given this board's known caveat that
+  reconnecting serial mid-test can itself trigger a reset, corrupting exactly this kind of
+  multi-wake observation). The rounding logic itself is fully covered by the host unit
+  tests instead.
 - **Backend idea**: none — already fully supported as documented.
 
 ### F3. Deep sleep / wake integration
