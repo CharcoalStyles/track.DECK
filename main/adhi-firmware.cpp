@@ -139,6 +139,39 @@ static bool wake_was_boot_button(void) {
     return (status & (1ULL << BOOT_BUTTON_PIN)) != 0;
 }
 
+// Bug fix: PWR is very likely a momentary self-latching power switch,
+// not a plain wake input (see the power-latch comment in app_main). The
+// original Waveshare reference example treats any PWR-triggered wake as
+// "the user wants to power off." Our own PWR still means "sync now" on
+// a tap (unchanged, relied on throughout this whole project's testing)
+// -- only a *held* PWR press means power off, checked via
+// wait_for_tap_or_hold() below.
+static bool wake_was_pwr_button(void) {
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
+        return false;
+    }
+    uint64_t status = esp_sleep_get_ext1_wakeup_status();
+    return (status & (1ULL << PWR_BUTTON_PIN)) != 0;
+}
+
+// Instant (no e-ink refresh delay) visible confirmation that the device
+// is executing code -- added alongside the power-latch timing fix,
+// replacing an earlier e-ink splash message that took ~2s (the panel's
+// own fixed full-refresh time) and would have corrupted
+// wait_for_tap_or_hold()'s timing if shown before it. Reconfigures the
+// pin fresh every call since deep sleep doesn't preserve normal GPIO
+// direction config.
+static void led_set(bool on) {
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    // Active-low -- found via hardware testing: the original active-high
+    // assumption had this backwards, so the LED was off for the whole
+    // awake cycle and only flashed briefly right as enter_deep_sleep()'s
+    // led_set(false) call (driving it "off" = high, actually turning it
+    // on) ran just before esp_deep_sleep_start() cut the GPIO drive.
+    gpio_set_level(LED_PIN, on ? 0 : 1);
+}
+
 // ---------------------------------------------------------------------
 // Wifi STA connect (06_WIFI_STA pattern)
 // ---------------------------------------------------------------------
@@ -992,6 +1025,7 @@ static void enter_deep_sleep(void) {
 
     BoardPower_EPD_OFF();
     BoardPower_Audio_OFF();
+    led_set(false);
     ESP_ERROR_CHECK(rtc_gpio_hold_en((gpio_num_t)VBAT_PWR_PIN));
 
     esp_deep_sleep_start();
@@ -1300,18 +1334,19 @@ static bool skip_checkin(const char *checkin_id) {
     return ok;
 }
 
-// Distinguishes a tap (record) from a hold (skip a live check-in) on the
-// very press that woke the device via BOOT. Returns as soon as either
-// the pin releases (tap) or it's still held past LONG_PRESS_MS (hold) --
-// the hold case doesn't wait for release, so feedback is immediate. A
+// Distinguishes a tap from a hold on the very press that woke the
+// device (BOOT: tap=record/hold=skip a live check-in; PWR:
+// tap=sync-now/hold=power off). Returns as soon as either the pin
+// releases (tap) or it's still held past LONG_PRESS_MS (hold) -- the
+// hold case doesn't wait for release, so feedback is immediate. A
 // normal tap has almost always already released by the time app_main
 // reaches this point (boot takes 300-700ms), so the tap path typically
 // returns on its very first check.
-static bool wait_for_tap_or_hold(void) {
+static bool wait_for_tap_or_hold(gpio_num_t pin) {
     const int LONG_PRESS_MS = 1500;
     const int POLL_INTERVAL_MS = 50;
     int held_ms = 0;
-    while (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
+    while (gpio_get_level(pin) == 0) {
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
         held_ms += POLL_INTERVAL_MS;
         if (held_ms >= LONG_PRESS_MS) {
@@ -1344,11 +1379,40 @@ static void run_checkin_skip_cycle(void) {
     s_last_screen.valid = false;
 }
 
+// Bug fix: PWR held ~1.5s genuinely powers the device off -- not just
+// deep sleep. VBAT_PWR_PIN very likely gates power to the ESP32 itself,
+// not just peripherals (see the power-latch comment in app_main); the
+// original Waveshare reference example cuts it directly with no further
+// action afterward, treating the cut itself as sufficiently immediate.
+// Deliberately does *not* arm any EXT1/RTC wake source afterward (unlike
+// enter_deep_sleep()) -- this is meant to be a genuine off state that
+// only a fresh physical PWR press (re-establishing power from scratch,
+// the same way the very first power-on works) can undo, not something
+// the RTC alarm or another button press should be able to interrupt.
+static void run_power_off_cycle(void) {
+    ESP_LOGI(TAG, "PWR held -- shutting down");
+    eink_show_message("SHUTTING DOWN");
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    BoardPower_EPD_OFF();
+    BoardPower_Audio_OFF();
+    led_set(false);
+    BoardPower_VBAT_OFF();
+
+    // Safety net in case cutting VBAT above doesn't kill power
+    // immediately (e.g. residual charge): fall into a deep sleep with no
+    // wake source armed at all, rather than the normal
+    // enter_deep_sleep() (which re-arms EXT1 and keeps VBAT held for the
+    // next scheduled wake).
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_deep_sleep_start();
+}
+
 static void run_push_to_talk_cycle(void) {
     ESP_LOGI(TAG, "push-to-talk: BOOT wake, starting voice cycle");
 
     // Tap vs hold only needs a GPIO read, no board power yet.
-    bool is_hold = wait_for_tap_or_hold();
+    bool is_hold = wait_for_tap_or_hold(BOOT_BUTTON_PIN);
     if (is_hold) {
         // Whether we end up skipping or falling through to record (no
         // live check-in to skip), either path needs a clean released
@@ -1364,10 +1428,9 @@ static void run_push_to_talk_cycle(void) {
     }
     bool have_live_checkin = s_last_screen.valid && s_last_screen.is_checkin;
 
-    BoardPower_Init();
-    BoardPower_VBAT_ON();
-    BoardPower_EPD_ON();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Power (VBAT/EPD) and the settle delay already happened in
+    // app_main() before this function was even called -- see the fix
+    // there for why that ordering matters.
 
     if (is_hold && have_live_checkin) {
         run_checkin_skip_cycle();
@@ -1449,14 +1512,43 @@ static void run_push_to_talk_cycle(void) {
 extern "C" void app_main(void) {
     s_boot_time_us = esp_timer_get_time();
 
-    // Installed as early as possible for maximum coverage. Actual
-    // mounting is lazy (first log call after BoardPower_VBAT_ON() powers
-    // the SD rail) and retries on every call until it succeeds -- see
-    // ensure_sdcard_mounted()'s comment.
+    // F8/bug fix: this must be the literal first thing app_main does --
+    // before NVS init, before installing the SD-log hook, before
+    // anything. This board's PWR button is very likely a momentary
+    // self-latching power switch, not a plain always-on GPIO input: the
+    // original Waveshare reference example (12_RTC_Sleep_Test) explicitly
+    // cuts VBAT_POWER_OFF() when it detects a PWR-triggered wake,
+    // implying the *only* thing keeping the board powered past the
+    // button's initial physical pulse is firmware asserting this GPIO
+    // itself, quickly. Any delay here risks the board losing power on
+    // battery alone right as the user releases the button -- completely
+    // masked whenever USB is plugged in (which supplies power directly,
+    // regardless of this GPIO), which is exactly how this went unnoticed
+    // through this whole session's testing. Release the sleep-time hold
+    // before driving the pin again, matching the pin's own hold/release
+    // pairing.
+    rtc_gpio_hold_dis((gpio_num_t)VBAT_PWR_PIN);
+    BoardPower_Init();
+    BoardPower_VBAT_ON();
+    BoardPower_EPD_ON();
+
+    // Instant visible confirmation the device is executing code --
+    // replaces an earlier e-ink splash message here, which took ~2s (the
+    // panel's fixed full-refresh time) and would have corrupted
+    // wait_for_tap_or_hold()'s timing below if left in this spot.
+    led_set(true);
+
+    // Installed right after the power latch above, not before --
+    // SD-card logging tries a fresh mount attempt on *every* log call
+    // until it succeeds (see ensure_sdcard_mounted()'s comment), and the
+    // SD card has no power until BoardPower_VBAT_ON() just ran. Any log
+    // line issued before that point would previously have added its own
+    // mount-attempt delay before the power latch -- exactly the kind of
+    // self-inflicted delay this whole reordering is fixing.
     esp_log_set_vprintf(sd_log_vprintf);
 
-    // NVS init first, per standard ESP-IDF convention -- required before
-    // wifi, and independent of every other subsystem below.
+    // NVS init, per standard ESP-IDF convention -- required before wifi,
+    // and independent of every other subsystem below.
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1464,28 +1556,32 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(nvs_err);
 
-    // VBAT hold survives deep sleep; release before we can drive that
-    // GPIO again this cycle (the EPD is fully power-cycled every wake now,
-    // so its own rail needs no equivalent hold/release pair).
-    rtc_gpio_hold_dis((gpio_num_t)VBAT_PWR_PIN);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     const char *reset_reason = reset_reason_to_string(esp_reset_reason());
     const char *wake_reason = wake_reason_to_string();
     ESP_LOGI(TAG, "boot: reset_reason=%s wake_reason=%s", reset_reason, wake_reason);
 
     // F6: BOOT is dedicated to push-to-talk and takes a completely
-    // separate path -- checked before any of the normal cycle's board
-    // power-on/wifi/sync setup below, since run_push_to_talk_cycle()
-    // does its own power-on and never returns (ends in its own
-    // enter_deep_sleep() call).
+    // separate path -- power is already latched above either way, so
+    // run_push_to_talk_cycle() no longer needs its own power-on calls.
+    // Never returns (ends in its own enter_deep_sleep() call).
     if (wake_was_boot_button()) {
         run_push_to_talk_cycle();
     }
 
-    BoardPower_Init();
-    BoardPower_VBAT_ON();
-    BoardPower_EPD_ON();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Bug fix: PWR tap still means "sync now" (unchanged, falls through
+    // to the normal cycle below); a held PWR press instead means "power
+    // off" -- see run_power_off_cycle()'s comment. Checked here, not
+    // before the BOOT check above, since only one of BOOT/PWR can have
+    // triggered this particular wake anyway.
+    if (wake_was_pwr_button()) {
+        bool pwr_is_hold = wait_for_tap_or_hold(PWR_BUTTON_PIN);
+        if (pwr_is_hold) {
+            run_power_off_cycle();
+            // never returns
+        }
+    }
 
     // TZ env state lives in normal RAM and does not survive deep sleep;
     // re-apply the last-known value every wake so localtime()/log

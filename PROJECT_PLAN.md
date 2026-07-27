@@ -748,6 +748,62 @@ multi-device/fleet concept, no offline queueing/delta sync, no synthesized TTS r
 
 ---
 
+## Post-Phase-2: battery power-on bug + PWR shutdown (2026-07-27)
+
+**Critical bug found after F1-F8 were all complete**: the device only ran with USB
+plugged in — on battery alone, pressing PWR/BOOT did nothing. Root cause: this board's
+`VBAT_PWR_PIN` almost certainly gates a momentary self-latching power switch, not a plain
+GPIO input — the original Waveshare reference example (`12_RTC_Sleep_Test`) explicitly
+cuts `VBAT_POWER_OFF()` the instant it detects a PWR-triggered wake, which only makes
+sense if firmware is expected to *quickly* assert this GPIO itself to keep the board
+powered past PWR's initial physical pulse, before some internal hold/capacitor lets go.
+Two things added during this session's F6/F7/F8 work plausibly pushed `BoardPower_VBAT_ON()`
+past that window, and neither was ever caught because **every single test all session was
+done with USB connected**, which powers the board directly regardless of this GPIO,
+completely masking the problem:
+
+1. F7's `wait_for_tap_or_hold()` blocked for up to 1.5-2s *before any board power call at
+   all*, on every BOOT-triggered wake.
+2. The SD-card debug logging (`sd_log_vprintf`, F6) retries a fresh SD mount attempt on
+   *every single log line* until it succeeds — and every log line issued before
+   `BoardPower_VBAT_ON()` triggered one against a card that had no power yet, adding
+   unknown delay depending on how long a doomed `esp_vfs_fat_sdmmc_mount()` call takes to
+   fail.
+
+**Fix**: `BoardPower_Init()`/`BoardPower_VBAT_ON()`/`BoardPower_EPD_ON()` now run as the
+literal first lines of `app_main()` — before NVS init, before installing the SD-log hook,
+before anything. `run_push_to_talk_cycle()` no longer does its own power-on (redundant now)
+and its tap-vs-hold detection runs immediately after, with no slow operation in between.
+**Confirmed fixed on hardware**: device now boots and runs correctly on battery alone with
+USB fully disconnected.
+
+**Two small features added alongside, at the user's request while testing the fix**:
+
+- **Instant boot indicator**: the onboard LED (GPIO3) now lights immediately at boot and
+  stays lit for the whole awake cycle (off once asleep) — replaces an earlier idea of an
+  e-ink "STARTING..." splash message, which would have cost a ~2s full refresh (the
+  panel's own fixed timing) and, worse, would have pushed BOOT's tap-vs-hold detection
+  that much later than the actual physical press if shown before it, corrupting the
+  hold-to-skip timing from F7. **Real bug found via hardware testing**: the LED is
+  active-low, not active-high as first assumed — the initial version had this backwards,
+  so the LED was off for the entire awake cycle and only flashed briefly right as
+  `enter_deep_sleep()`'s "off" call (driving it high) actually turned it on for an instant
+  before `esp_deep_sleep_start()` cut the GPIO drive. Fixed by inverting `led_set()`'s
+  polarity.
+- **Hold PWR (~1.5s) to genuinely power off**: mirrors F7's BOOT tap/hold pattern
+  (`wait_for_tap_or_hold()`, now generalized to take a pin parameter) — a PWR *tap* still
+  means "sync now" (unchanged, relied on throughout this whole project's testing); only a
+  *held* PWR press shows "SHUTTING DOWN" and then actually cuts `VBAT_PWR_PIN` (not just
+  deep sleep), with no wake source re-armed afterward as a safety net — matching the
+  original reference example's exact behavior, which trusts the VBAT cut alone to be
+  sufficiently immediate. Deliberately not "every PWR press powers off" (the reference
+  design's literal behavior), since that would have removed the "tap PWR to sync now"
+  convenience already in active use. Confirmed on hardware: shows the message, genuinely
+  powers off (LED off, no further activity), and a fresh physical PWR press brings it back
+  normally afterward.
+
+---
+
 ## Critical files / reference paths
 
 - `~/Code/ESP32-S3-ePaper-1.54/02_Example/ESP-IDF/V2/11_FactoryProgram/` — driver
