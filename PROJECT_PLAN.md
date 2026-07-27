@@ -699,12 +699,46 @@ consider (not applied yet, just noted for later discussion).
 - **Backend idea**: none — built for exactly this.
 
 ### F8. Robustness / power-safety hardening pass
-- [ ] Verify bounded retry+backoff under real failure (backend down, wifi unreachable,
+- [x] Verify bounded retry+backoff under real failure (backend down, wifi unreachable,
       malformed JSON); confirm peripherals are power-gated when unused (GPIO42 audio
       circuit, GPIO6 EPD power, both active-low) rather than left powered through sleep.
-- **Test**: stop the backend mid-cycle, confirm the device falls back to the
-  last-known-good `poll_interval_seconds` and sleeps rather than retrying indefinitely;
-  confirm current draw drops when peripherals are gated.
+  - **Peripheral gating confirmed by code review**: `port_power.cpp`'s `BoardPower_EPD_ON/OFF()`
+        and `BoardPower_Audio_ON/OFF()` correctly drive active-low levels (`_ON` = GPIO low,
+        `_OFF` = high), and `enter_deep_sleep()` unconditionally calls both `_OFF()`s on
+        every path into sleep — the normal sync cycle, the F6 push-to-talk recording path,
+        and the F7 check-in-skip path all funnel through this same function, so there's no
+        path that leaves either rail powered into sleep. Actual current-draw drop is a
+        manual multimeter check, not something verifiable from this session (same caveat as
+        F5's `battery_mv` cross-check) — left for the user to confirm.
+  - **Real gap found and fixed**: a failed sync cycle previously just logged a warning and
+        left the display completely untouched — correct per CLAUDE.md's "a sync failure or
+        stale display is a degraded UX, never a missed reminder," but that line is about not
+        treating staleness as catastrophic, not about hiding that something's actually
+        wrong. Confirmed via hardware testing (see below) that silently doing nothing gave
+        zero visible signal of a real wifi/backend problem. Fixed: `eink_render_last_known()`
+        (built for F6's post-PTT screen restore) now takes an optional `notice` string,
+        drawn in place of the status bar's plain divider line (same row, same 7px height,
+        no layout changes needed elsewhere) — a failed cycle now calls it with
+        `"SYNC FAILED"` instead of skipping the refresh entirely. Also hardened to render
+        even when there's no persisted screen yet at all (e.g. the very first-ever sync
+        fails before anything has ever succeeded) — shows just the status bar/notice with
+        blank body content, rather than doing nothing.
+  - **Malformed JSON**: relies on `sync_snapshot_parse()`'s existing per-section
+        `*_valid`/`has_*` degrade-gracefully flags, already extensively covered by
+        `sync_proto`'s host-side Catch2 suite since Phase 0 — not re-verified via a live
+        malformed-response hardware test, since there's no real endpoint that returns a 2xx
+        non-JSON body at the exact `/device/sync` path to trigger this end-to-end without
+        modifying the backend itself.
+- **Test**: hardware-confirmed via a genuinely unreachable backend (temporarily pointed
+  `BACKEND_BASE_URL` at a closed port on the same LAN — fails fast with connection-refused,
+  no hang — then reverted afterward). Confirmed across two consecutive real failed cycles:
+  exactly 3 bounded attempts with doubling backoff (1000ms → 2000ms) before giving up,
+  `RTC alarm scheduled at ... (+300s)` — correctly fell back to the last-known-good
+  `poll_interval_seconds` rather than hanging or retrying forever — and a clean
+  `entering deep sleep now` both times, no crash. Also confirmed on real hardware, in a
+  follow-up flash: the new "SYNC FAILED" notice actually renders correctly on the physical
+  display, with the rest of the screen (battery/time/dashboard content) unaffected, and a
+  subsequent successful sync shows no regression (plain divider line, no stray notice).
 - **Backend idea**: a second, distinct alert alongside F3's — "no successful sync in over
   `poll_interval_seconds * 3`" — since a silently-dead/offline device and a noisy
   crash-loop are different failure signatures worth telling apart.

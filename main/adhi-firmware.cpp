@@ -632,7 +632,12 @@ static int draw_wrapped_text(const char *text, int x0, int y0, int max_width_px,
 // is just omitted, not flagged as an error on-screen.
 // ---------------------------------------------------------------------
 
-static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_pct) {
+// F8: notice is non-null only when this cycle's sync failed -- drawn in
+// place of the plain divider line (same row, y=22) rather than adding a
+// new one, since a scale-1 text line (7px tall) fits in the same space
+// without disturbing anything above (status bar text, y=4-18) or below
+// (body content starts at y=30).
+static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_pct, const char *notice) {
     char battery_buf[8];
     snprintf(battery_buf, sizeof(battery_buf), "%d%%", battery_pct);
     int battery_w = (int)strlen(battery_buf) * (FONT_GLYPH_W + 1) * 2;
@@ -655,8 +660,12 @@ static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_
         draw_text(temp_buf, (EPD_WIDTH - temp_w) / 2, 4, 2, DRIVER_COLOR_BLACK);
     }
 
-    for (int x = 4; x < EPD_WIDTH - 4; x++) {
-        EPD_DrawColorPixel(x, 22, DRIVER_COLOR_BLACK);
+    if (notice) {
+        draw_text(notice, 8, 22, 1, DRIVER_COLOR_BLACK);
+    } else {
+        for (int x = 4; x < EPD_WIDTH - 4; x++) {
+            EPD_DrawColorPixel(x, 22, DRIVER_COLOR_BLACK);
+        }
     }
 }
 
@@ -796,7 +805,7 @@ static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
     eink_ensure_initialized();
     EPD_Clear();
 
-    draw_status_bar(snap.has_weather, (float)snap.weather.temperature_c, battery_pct);
+    draw_status_bar(snap.has_weather, (float)snap.weather.temperature_c, battery_pct, nullptr);
 
     const sync_checkin_t *live_checkin = find_live_checkin(snap);
     next_item_t next = find_next_item(snap);
@@ -823,30 +832,36 @@ static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
     s_last_screen.next = next;
 }
 
-// F6: redraws whatever eink_render() last actually drew, using the
+// F6/F8: redraws whatever eink_render() last actually drew, using the
 // persisted summary above -- no wifi/sync involved. Used after a
-// push-to-talk cycle finishes, so the display goes back to the normal
-// screen instead of sitting on "SENT"/"UPLOAD FAILED" until the next
-// real sync (which could be minutes away).
-static void eink_render_last_known(int battery_pct) {
-    if (!s_last_screen.valid) {
-        ESP_LOGW(TAG, "no last-known screen to restore, leaving display as-is");
-        return;
-    }
-
+// push-to-talk cycle finishes (notice is null), so the display goes
+// back to the normal screen instead of sitting on "SENT"/"UPLOAD FAILED"
+// until the next real sync; and after a failed sync cycle (notice is
+// "SYNC FAILED"), so a wifi/backend problem is actually visible on the
+// device instead of just silently leaving the stale screen up with no
+// signal anything's wrong. Renders even with no persisted screen yet
+// (e.g. the very first-ever sync fails before anything has ever
+// succeeded) -- still shows the status bar/notice, just no body content.
+static void eink_render_last_known(int battery_pct, const char *notice) {
     eink_ensure_initialized();
     EPD_Clear();
 
-    draw_status_bar(s_last_screen.has_weather, s_last_screen.weather_temp_c, battery_pct);
+    bool has_weather = s_last_screen.valid && s_last_screen.has_weather;
+    float weather_temp_c = s_last_screen.valid ? s_last_screen.weather_temp_c : 0.0f;
+    draw_status_bar(has_weather, weather_temp_c, battery_pct, notice);
 
-    if (s_last_screen.is_checkin) {
-        draw_checkin(s_last_screen.checkin_prompt);
-    } else {
-        draw_dashboard(s_last_screen.has_weather, s_last_screen.weather_cloud_pct, s_last_screen.next);
+    if (s_last_screen.valid) {
+        if (s_last_screen.is_checkin) {
+            draw_checkin(s_last_screen.checkin_prompt);
+        } else {
+            draw_dashboard(s_last_screen.has_weather, s_last_screen.weather_cloud_pct, s_last_screen.next);
+        }
     }
 
     EPD_Display();
-    ESP_LOGI(TAG, "e-ink render done (restored last-known %s)", s_last_screen.is_checkin ? "check-in" : "dashboard");
+    ESP_LOGI(TAG, "e-ink render done (%s%s)",
+             s_last_screen.valid ? (s_last_screen.is_checkin ? "restored check-in" : "restored dashboard") : "blank, no last-known screen yet",
+             notice ? ", with notice" : "");
 }
 
 // F6 (PROJECT_PLAN.md): simple full-refresh status message, reusing the
@@ -1418,7 +1433,7 @@ static void run_push_to_talk_cycle(void) {
             // Give the user a moment to actually see the confirmation
             // before restoring the normal screen underneath it.
             vTaskDelay(pdMS_TO_TICKS(3000));
-            eink_render_last_known(battery_pct);
+            eink_render_last_known(battery_pct, nullptr);
         }
     }
 
@@ -1567,16 +1582,19 @@ extern "C" void app_main(void) {
     Shtc3_ReadTempHumi(&temp_c, &humidity_pct);
     ESP_LOGI(TAG, "SHTC3: temp=%.1fC humidity=%.1f%%", temp_c, humidity_pct);
 
-    // Only redraw the e-ink display when there's fresh data to show it --
-    // e-ink is bistable (holds its image with no power), so skipping the
-    // refresh on a failed cycle naturally leaves the last successful
-    // content on screen instead of blanking it. Matches CLAUDE.md: "a
-    // sync failure or stale display is a degraded UX, never a missed
-    // reminder" -- a stale screen beats an empty one.
+    // F8: on a failed cycle, still redraw (from the persisted summary,
+    // not a fresh snapshot) with a "SYNC FAILED" notice -- CLAUDE.md's
+    // "a sync failure or stale display is a degraded UX, never a missed
+    // reminder" is about not treating a stale display as catastrophic,
+    // not about hiding the fact that something's actually wrong. Found
+    // via F8 hardware testing that silently leaving the old screen up
+    // with zero indication gives no visible signal of a real wifi/backend
+    // problem.
     if (have_fresh_snapshot) {
         eink_render(*snap, battery_pct);
     } else {
-        ESP_LOGW(TAG, "skipping e-ink refresh -- no fresh snapshot this cycle, display stays as-is");
+        ESP_LOGW(TAG, "sync failed this cycle -- showing last-known screen with a SYNC FAILED notice");
+        eink_render_last_known(battery_pct, "SYNC FAILED");
     }
     if (snap) {
         heap_caps_free(snap);
