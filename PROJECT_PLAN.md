@@ -658,12 +658,44 @@ consider (not applied yet, just noted for later discussion).
 - **Backend idea**: none — `voice.py`'s contract already matches the spec precisely.
 
 ### F7. Check-in display + reply/skip flow
-- [ ] Detect a `checkins[]` entry with `fired_at` set, display `prompt_text` prominently,
+- [x] Detect a `checkins[]` entry with `fired_at` set, display `prompt_text` prominently,
       support voice-reply (`POST /voice` with `checkin_id`) and skip
       (`POST /device/checkin/{id}/skip`).
-- **Test**: trigger a test check-in via the backend's `POST /debug/checkin`
-  (`main.py:535-543`), confirm it appears on the next sync, and confirm both the
-  reply-by-voice and skip paths resolve it correctly.
+  - **Display was already done by F4**; this added the interaction half. Both actions
+        reuse BOOT (no third button exists on this board): tap to reply by voice (unchanged
+        from F6), hold ~1.5s to skip — chosen over repurposing PWR so PWR's existing "wake
+        and sync now" meaning stays untouched regardless of whether a check-in is live.
+  - **Tap/hold detection** (`wait_for_tap_or_hold()`) replaces the old fixed "wait up to
+        500ms for release" guard that only protected against misreading the wake-press's
+        tail as a stop-click. It now polls until either the pin releases (tap) or stays low
+        past 1500ms (hold, returns immediately without waiting for release, for responsive
+        feedback). A hold with no live check-in to skip falls through to record like a
+        normal tap, rather than doing nothing.
+  - **`s_last_screen` (from the post-PTT-restore work) now also carries the checkin's
+        `id`**, so a BOOT tap while a check-in is showing tags the upload with
+        `checkin_id` (new optional multipart field in `upload_voice_note()`); skip
+        (`skip_checkin()`, new) posts to `/device/checkin/{id}/skip` with the same id, no
+        body.
+  - **Correctness decision**: neither path restores the cached screen afterward the way a
+        plain (non-check-in) voice note does — `s_last_screen` at that point describes a
+        check-in that's just been resolved (replied to or skipped), so redrawing it would
+        show an already-resolved prompt as if still pending. Both `run_checkin_skip_cycle()`
+        and the checkin-tagged branch of `run_push_to_talk_cycle()` invalidate
+        `s_last_screen` instead and leave the SENT/SKIPPED confirmation up until the next
+        real sync brings fresh content.
+  - **UX fix from hardware testing**: the recording screen for a check-in reply now shows
+        "REPLYING..." with the check-in's prompt text still visible underneath (new
+        `eink_show_checkin_recording()`, sharing `draw_checkin()`'s exact layout) instead of
+        the generic "RECORDING... PRESS BOOT TO STOP" — the user should be able to see what
+        they're replying to while actually talking, not just before recording starts.
+- **Test**: hardware-confirmed via the backend's `POST /debug/checkin` (`main.py:535-543`)
+  across two separate live check-ins (one per path, since answering one resolves it):
+  tapped BOOT to reply by voice, confirmed the check-in resolved on the backend
+  (`GET /debug/device-sync` no longer showed it pending) and the reply was routed
+  correctly; triggered a second check-in, held BOOT ~2s, confirmed SKIPPING → SKIPPED and
+  the check-in resolved as skipped. Also confirmed a hold with nothing to skip falls
+  through to a normal recording (implicit in the tap/hold logic, not separately
+  hardware-tested).
 - **Backend idea**: none — built for exactly this.
 
 ### F8. Robustness / power-safety hardening pass

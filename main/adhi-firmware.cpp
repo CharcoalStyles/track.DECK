@@ -784,6 +784,7 @@ struct last_screen_t {
     bool valid;
     bool is_checkin;
     char checkin_prompt[SYNC_STR_TEXT_LEN];
+    char checkin_id[SYNC_STR_ID_LEN]; // F7: needed for voice-reply tagging and skip
     bool has_weather;
     float weather_temp_c;
     int weather_cloud_pct;
@@ -813,6 +814,8 @@ static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
     if (live_checkin) {
         strncpy(s_last_screen.checkin_prompt, live_checkin->prompt_text, sizeof(s_last_screen.checkin_prompt) - 1);
         s_last_screen.checkin_prompt[sizeof(s_last_screen.checkin_prompt) - 1] = '\0';
+        strncpy(s_last_screen.checkin_id, live_checkin->id, sizeof(s_last_screen.checkin_id) - 1);
+        s_last_screen.checkin_id[sizeof(s_last_screen.checkin_id) - 1] = '\0';
     }
     s_last_screen.has_weather = snap.has_weather;
     s_last_screen.weather_temp_c = (float)snap.weather.temperature_c;
@@ -857,6 +860,20 @@ static void eink_show_message(const char *message) {
     draw_wrapped_text(message, 8, 80, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
     EPD_Display();
     ESP_LOGI(TAG, "e-ink message shown: %s", message);
+}
+
+// F7: recording a reply to a live check-in keeps the same layout
+// draw_checkin() uses (same header position, same prompt placement at
+// scale 1) so the prompt stays put on screen instead of being replaced
+// by a generic "RECORDING..." message -- the user should still be able
+// to see what they're replying to while talking.
+static void eink_show_checkin_recording(const char *prompt_text) {
+    eink_ensure_initialized();
+    EPD_Clear();
+    draw_text("REPLYING...", 8, 30, 2, DRIVER_COLOR_BLACK);
+    draw_wrapped_text(prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
+    EPD_Display();
+    ESP_LOGI(TAG, "e-ink message shown: replying to check-in");
 }
 
 // ---------------------------------------------------------------------
@@ -1043,17 +1060,10 @@ static wav_header_t build_wav_header(uint32_t sample_rate, uint16_t num_channels
 static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
     const size_t chunk_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_CHUNK_MS / 1000;
 
-    // Guard against misreading the tail of the original wake-press as an
-    // immediate stop signal: don't construct the button object (which
-    // reconfigures the pin and starts its own debounce state machine)
-    // until the pin genuinely reads released. A normal tap has almost
-    // always already released by this point (boot takes 300-700ms), so
-    // this loop typically exits on its very first check.
-    int waited_ms = 0;
-    while (gpio_get_level(BOOT_BUTTON_PIN) == 0 && waited_ms < 500) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        waited_ms += 20;
-    }
+    // Callers only ever reach here after wait_for_tap_or_hold() has
+    // already confirmed the original wake-press was a tap (i.e. already
+    // released) -- no separate "wait for release" guard needed here
+    // anymore before constructing the button object below.
 
     // BOOT_BUTTON_PIN was configured as an EXT1 (RTC-domain) wake source
     // by the *previous* cycle's enter_deep_sleep() call -- this is the
@@ -1126,8 +1136,24 @@ static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
 // /device/sync, voice failures are already designed to be silent/
 // best-effort backend-side (spec's fire-and-forget framing), so one
 // attempt is enough.
-static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes) {
+//
+// F7: checkin_id is non-null only when this recording is a reply to a
+// currently-displayed live check-in -- sent as its own form field
+// (spec section 3.2) so the backend routes the reply to that check-in
+// instead of resolving it by keyword/recency.
+static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, const char *checkin_id) {
     const char *boundary = "----adhiVoiceBoundary7f3a";
+
+    char checkin_part[192] = {0};
+    int checkin_part_len = 0;
+    if (checkin_id && checkin_id[0] != '\0') {
+        checkin_part_len = snprintf(checkin_part, sizeof(checkin_part),
+                                     "--%s\r\n"
+                                     "Content-Disposition: form-data; name=\"checkin_id\"\r\n"
+                                     "\r\n"
+                                     "%s\r\n",
+                                     boundary, checkin_id);
+    }
 
     char preamble[192];
     int preamble_len = snprintf(preamble, sizeof(preamble),
@@ -1143,7 +1169,7 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes) {
     size_t mono_bytes = stereo_bytes / 2; // same bit depth, half the channels
     wav_header_t wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, (uint32_t)mono_bytes);
 
-    size_t content_length = (size_t)preamble_len + sizeof(wav_hdr) + mono_bytes + (size_t)epilogue_len;
+    size_t content_length = (size_t)checkin_part_len + (size_t)preamble_len + sizeof(wav_hdr) + mono_bytes + (size_t)epilogue_len;
 
     char content_type_header[64];
     snprintf(content_type_header, sizeof(content_type_header), "multipart/form-data; boundary=%s", boundary);
@@ -1176,6 +1202,9 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes) {
     }
 
     bool write_ok = true;
+    if (checkin_part_len > 0) {
+        write_ok = write_ok && esp_http_client_write(client, checkin_part, checkin_part_len) >= 0;
+    }
     write_ok = write_ok && esp_http_client_write(client, preamble, preamble_len) >= 0;
     write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(&wav_hdr), sizeof(wav_hdr)) >= 0;
 
@@ -1227,15 +1256,111 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes) {
     return ok;
 }
 
+// F7: POST /device/checkin/{id}/skip -- no request body (spec section
+// 3.3). Note the /device prefix: POST /checkin/{id}/skip (no /device) is
+// a *different* endpoint for the backend's own magic-link flow and does
+// not accept this device's auth token at all.
+static bool skip_checkin(const char *checkin_id) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/device/checkin/%s/skip", BACKEND_BASE_URL, checkin_id);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 10000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "auth", API_TOKEN);
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        ok = (status >= 200 && status < 300);
+        ESP_LOGI(TAG, "checkin skip %s (status %d)", ok ? "OK" : "FAILED", status);
+    } else {
+        ESP_LOGE(TAG, "checkin skip failed: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+    return ok;
+}
+
+// Distinguishes a tap (record) from a hold (skip a live check-in) on the
+// very press that woke the device via BOOT. Returns as soon as either
+// the pin releases (tap) or it's still held past LONG_PRESS_MS (hold) --
+// the hold case doesn't wait for release, so feedback is immediate. A
+// normal tap has almost always already released by the time app_main
+// reaches this point (boot takes 300-700ms), so the tap path typically
+// returns on its very first check.
+static bool wait_for_tap_or_hold(void) {
+    const int LONG_PRESS_MS = 1500;
+    const int POLL_INTERVAL_MS = 50;
+    int held_ms = 0;
+    while (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+        held_ms += POLL_INTERVAL_MS;
+        if (held_ms >= LONG_PRESS_MS) {
+            return true; // still held past the threshold -- a hold
+        }
+    }
+    return false; // released before the threshold -- a normal tap
+}
+
+// F7: skip the currently-displayed live check-in. Shows a confirmation,
+// then deliberately does *not* restore s_last_screen afterward -- it
+// still describes the now-resolved check-in, and redrawing it would
+// make an already-skipped prompt look like it's still pending. The next
+// real sync (PWR press or the regular RTC alarm) will bring fresh
+// content; leaving the confirmation up until then is a minor, honest
+// staleness, not a wrong one.
+static void run_checkin_skip_cycle(void) {
+    ESP_LOGI(TAG, "push-to-talk: BOOT held, skipping live check-in %s", s_last_screen.checkin_id);
+    eink_show_message("SKIPPING...");
+
+    bool wifi_ok = wifi_connect();
+    bool skip_ok = false;
+    if (wifi_ok) {
+        skip_ok = skip_checkin(s_last_screen.checkin_id);
+    } else {
+        ESP_LOGE(TAG, "checkin skip: wifi never connected");
+    }
+    eink_show_message(skip_ok ? "SKIPPED" : "SKIP FAILED");
+
+    s_last_screen.valid = false;
+}
+
 static void run_push_to_talk_cycle(void) {
     ESP_LOGI(TAG, "push-to-talk: BOOT wake, starting voice cycle");
+
+    // Tap vs hold only needs a GPIO read, no board power yet.
+    bool is_hold = wait_for_tap_or_hold();
+    if (is_hold) {
+        // Whether we end up skipping or falling through to record (no
+        // live check-in to skip), either path needs a clean released
+        // state before touching the button component again -- same
+        // false-positive-click concern record_until_stopped() guards
+        // against for its own stop detection. Bounded so a genuinely
+        // stuck button can't hang the device forever.
+        int wait_ms = 0;
+        while (gpio_get_level(BOOT_BUTTON_PIN) == 0 && wait_ms < 5000) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            wait_ms += 50;
+        }
+    }
+    bool have_live_checkin = s_last_screen.valid && s_last_screen.is_checkin;
 
     BoardPower_Init();
     BoardPower_VBAT_ON();
     BoardPower_EPD_ON();
-    BoardPower_Audio_ON();
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    if (is_hold && have_live_checkin) {
+        run_checkin_skip_cycle();
+        enter_deep_sleep();
+        return;
+    }
+
+    BoardPower_Audio_ON();
     BoardAdc_Init();
     int battery_pct = Get_Batterylevel();
 
@@ -1246,7 +1371,11 @@ static void run_push_to_talk_cycle(void) {
     // initialized" error before self-recovering).
     I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     Codec_StartInit();
-    eink_show_message("RECORDING... PRESS BOOT TO STOP");
+    if (have_live_checkin) {
+        eink_show_checkin_recording(s_last_screen.checkin_prompt);
+    } else {
+        eink_show_message("RECORDING... PRESS BOOT TO STOP");
+    }
 
     const size_t max_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_MAX_RECORD_MS / 1000;
     auto *buf = static_cast<uint8_t *>(heap_caps_malloc(max_bytes, MALLOC_CAP_SPIRAM));
@@ -1267,17 +1396,30 @@ static void run_push_to_talk_cycle(void) {
         bool wifi_ok = wifi_connect();
         bool upload_ok = false;
         if (wifi_ok) {
-            upload_ok = upload_voice_note(buf, recorded_bytes);
+            // F7: tag this reply to the live check-in, if one's showing,
+            // so the backend routes it to that check-in instead of
+            // resolving it by keyword/recency.
+            upload_ok = upload_voice_note(buf, recorded_bytes, have_live_checkin ? s_last_screen.checkin_id : nullptr);
         } else {
             ESP_LOGE(TAG, "push-to-talk: skipping upload -- wifi never connected");
         }
         eink_show_message(upload_ok ? "SENT" : "UPLOAD FAILED");
         heap_caps_free(buf);
 
-        // Give the user a moment to actually see the confirmation
-        // before restoring the normal screen underneath it.
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        eink_render_last_known(battery_pct);
+        if (have_live_checkin) {
+            // This reply resolves the check-in -- the persisted screen
+            // now describes something already answered, so redrawing it
+            // would make an already-replied-to prompt look like it's
+            // still pending. Leave the confirmation up instead (same
+            // reasoning as run_checkin_skip_cycle()); the next real sync
+            // brings fresh content.
+            s_last_screen.valid = false;
+        } else {
+            // Give the user a moment to actually see the confirmation
+            // before restoring the normal screen underneath it.
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            eink_render_last_known(battery_pct);
+        }
     }
 
     // The regular sync cadence is untouched here -- no
