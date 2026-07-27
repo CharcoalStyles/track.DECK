@@ -221,8 +221,9 @@ uses 64-byte wrap bursts) — see `github.com/espressif/arduino-esp32` issue #12
 that every step above logs/behaves correctly. ✅ Backend actually received real sync calls
 (`GET /debug/device-state`, `adhi-backend/main.py:593`). ✅ E-ink updates confirmed
 visually. ✅ Audio loopback confirmed audible. ✅ SD card write/read confirmed by direct
-inspection. ✅ BOOT-button wake confirmed repeatedly. ⬜ RTC-alarm wake — not yet observed
-un-prompted; still needs a real hands-off cycle.
+inspection. ✅ BOOT-button wake confirmed repeatedly. ✅ RTC-alarm (timer) wake confirmed —
+see the 1-minute clock-tick scheme below, which wakes unattended on the RTC alarm dozens of
+times in a row without any button involved.
 
 **Flashing note for this board**: its native USB-Serial/JTAG interface doesn't reliably
 auto-exit ROM download mode via software (RTS/DTR toggling) after `idf.py flash` — it
@@ -232,7 +233,62 @@ racing the brief post-wake awake-window before the device returns to deep sleep 
 BOOT button, unplug/replug USB while still holding it, then release BOOT after replugging.
 `idf.py monitor` doesn't work in a non-interactive shell (needs a real TTY); reading
 `/dev/ttyACM0` directly via a small pyserial script (without touching DTR/RTS, with
-auto-reconnect on transient read errors) works as a substitute.
+auto-reconnect on transient read errors) works as a substitute -- **but with an important
+caveat discovered during the clock-tick work below: opening a *new* pyserial connection to
+this board's native USB-Serial/JTAG interface can itself trigger a chip reset**, via the
+same DTR/RTS auto-reset circuitry `esptool` uses (every such unwanted reset shows up as
+`rst:0x15 (USB_UART_CHIP_RESET)`, reset_reason `unknown`). Repeatedly reconnecting to
+"check the log" can therefore prevent the device from ever reaching a real multi-cycle
+deep sleep, corrupting exactly the kind of multi-wake test this caveat itself was found
+by. When observing behavior across several wake cycles, prefer watching the physical
+device (screen/audio) over polling serial, or accept that serial polling resets the count.
+
+### Clock-tick wake scheme (built on top of Phase 1, in the same file)
+
+Not part of the original Phase 1 checklist, but implemented directly in
+`main/adhi-firmware.cpp` afterward: wakes every ~60s (RTC alarm aligned to the next whole
+minute boundary, not "current time + 60s" — see below) to repaint an on-screen clock via a
+quiet e-ink partial refresh; only every `s_ticks_per_sync`'th wake (derived from the
+server's `poll_interval_seconds / 60`, default 5) does the full wifi/backend/sensor/audio/SD
+cycle. State that must survive across these wakes (tick count, ticks-per-sync, the last TZ
+string, whether the e-ink partial baseline is seeded) lives in `RTC_DATA_ATTR` globals —
+ordinary RAM/heap does not survive deep sleep, only the RTC slow-memory region does.
+
+Also added: a minimal hand-rolled 5x7 bitmap font (`FONT_5X7`) to render "HH:MM" — no
+font/text-rendering library existed before this.
+
+**Real bugs found and fixed while building this**:
+- **E-ink controller loses all internal RAM/LUT state whenever `EPD_PWR_PIN` is cut** —
+  true partial refresh (quiet, fast) is only possible if the display stays powered between
+  wakes. Since wakes are now only ~60s apart and the SSD1681's standby draw is tiny next to
+  a full refresh or a wifi sync, `enter_deep_sleep()` no longer powers off the EPD (only
+  audio power gates off); the EPD's own power-rail GPIO needs the same `rtc_gpio_hold_en`
+  treatment as VBAT, or GPIO sleep-isolation could let it float.
+- **`eink_clock_tick()` must re-run `PortDisplay_Init()` every wake** (ESP32-side SPI/GPIO
+  state and the software framebuffer don't survive deep sleep regardless of what stays
+  externally powered) **but must never call `EPD_Init()`** on the quiet-tick path — that
+  pulses the SSD1681's hardware reset line, wiping the very internal state kept-powered EPD
+  was meant to preserve.
+- **Alarm drift**: scheduling "current RTC time + 60s" each cycle drifts away from true
+  minute boundaries over many cycles, since actual awake-processing time varies cycle to
+  cycle. Fixed by always rounding up to the start of the next whole minute instead
+  (self-correcting every cycle, no accumulation) — `rtc_schedule_alarm()` no longer takes an
+  interval parameter at all.
+- **Render-ordering latency**: the clock render originally happened *after* the entire
+  sync cycle (wifi/backend/sensors), adding several extra seconds of visible lag on sync
+  wakes for no reason — none of that work changes what the clock displays. Fixed by
+  rendering immediately on quiet ticks (nothing else to wait for), while sync wakes
+  deliberately still render only once, after all of that cycle's data is ready — rendering
+  early there too would mean a quick clock-only write followed by a second, fuller write
+  once Phase 2 renders real snapshot content in the same spot.
+- **Double refresh on every full/seed update**: `EPD_DisplayPartBaseImage()` (needed to
+  seed the SSD1681's partial-diffing baseline) already performs its own full visible
+  refresh internally — calling `EPD_Display()` first as well drew the identical content to
+  the screen twice in a row.
+- **Checkerboard ghosting**: the Phase 1 smoke-test checkerboard pattern is close to
+  worst-case for showing partial-refresh ghosting (e-ink physically retains a "ghost" of
+  heavily-contrasted content after repeated partial refreshes) — replaced with a plain
+  white background for the real clock content.
 
 ---
 

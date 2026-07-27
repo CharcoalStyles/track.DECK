@@ -19,6 +19,7 @@
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
+#include <esp_attr.h>
 #include <nvs_flash.h>
 #include <esp_netif.h>
 #include <esp_event.h>
@@ -62,6 +63,19 @@ static const char *TAG = "bringup";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
 static int64_t s_boot_time_us;
+
+// ---------------------------------------------------------------------
+// Persistent across deep sleep (RTC slow memory) -- reset to these
+// initializers only on a real power-on, not on a deep-sleep wake. Backs
+// the "wake every 1 minute for a clock tick, sync every Nth wake" scheme:
+// only the sync wake talks to wifi/the backend; the rest just repaint
+// the clock. TZ has to be re-applied every wake too, since setenv/tzset
+// state lives in normal RAM and does not survive deep sleep either.
+// ---------------------------------------------------------------------
+static RTC_DATA_ATTR uint32_t s_wake_tick_count = 0;
+static RTC_DATA_ATTR int s_ticks_per_sync = 5; // derived from poll_interval_seconds/60
+static RTC_DATA_ATTR char s_tz_posix[64] = "UTC0";
+static RTC_DATA_ATTR bool s_epd_seeded = false; // SSD1681 RAM holds a valid base image
 
 // ---------------------------------------------------------------------
 // Reset reason / wake reason (spec section 3.1's field table)
@@ -307,56 +321,145 @@ static void rtc_set_time_utc(pcf85063a_dev_t *rtc, int64_t now_epoch) {
              dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
 }
 
-// Schedules the alarm `poll_interval_seconds` after the RTC's *current*
-// time (whatever that is -- freshly set above, or whatever survived from
-// before if the sync failed). Pure seconds-of-day arithmetic: the PCF85063
-// alarm only matches sec/min/hour (day and weekday are always disabled by
-// pcf85063a_set_alarm), so there's no need to round-trip through epoch
-// time or worry about TZ/DST here at all.
-static void rtc_schedule_alarm(pcf85063a_dev_t *rtc, int poll_interval_seconds) {
+// Schedules the alarm for the start of the *next whole minute* (sec=0),
+// not "current time + 60s" -- the latter drifts away from true minute
+// boundaries over many cycles, since how many seconds each wake actually
+// takes (wifi, e-ink, audio...) varies slightly cycle to cycle. Rounding
+// up to the next minute boundary instead is self-correcting: it's
+// recomputed fresh from the current RTC reading every time, so there's
+// no accumulating drift, and the on-screen clock updates right at :00
+// seconds of each minute rather than a few seconds late. Pure
+// seconds-of-day arithmetic: the PCF85063 alarm only matches sec/min/hour
+// (day and weekday are always disabled by pcf85063a_set_alarm), so no
+// need to round-trip through epoch time or worry about TZ/DST here.
+static void rtc_schedule_alarm(pcf85063a_dev_t *rtc) {
     pcf85063a_datetime_t cur = {};
     pcf85063a_get_time_date(rtc, &cur);
 
     long seconds_of_day = (long)cur.hour * 3600 + (long)cur.min * 60 + cur.sec;
-    long alarm_seconds_of_day = (seconds_of_day + poll_interval_seconds) % 86400;
+    long alarm_seconds_of_day = (((seconds_of_day / 60) + 1) * 60) % 86400;
 
     pcf85063a_datetime_t alarm_dt = {};
     alarm_dt.hour = (uint8_t)(alarm_seconds_of_day / 3600);
     alarm_dt.min = (uint8_t)((alarm_seconds_of_day % 3600) / 60);
-    alarm_dt.sec = (uint8_t)(alarm_seconds_of_day % 60);
+    alarm_dt.sec = 0;
 
     pcf85063a_set_alarm(rtc, alarm_dt);
     pcf85063a_enable_alarm(rtc); // also clears any stale alarm flag
-    ESP_LOGI(TAG, "RTC alarm scheduled at %02d:%02d:%02d UTC (+%ds)",
-             alarm_dt.hour, alarm_dt.min, alarm_dt.sec, poll_interval_seconds);
+    ESP_LOGI(TAG, "RTC alarm scheduled at %02d:%02d:%02d UTC (next minute boundary)",
+             alarm_dt.hour, alarm_dt.min, alarm_dt.sec);
 }
 
 // ---------------------------------------------------------------------
-// E-ink: full refresh test pattern, then a partial-refresh update.
+// Minimal 5x7 bitmap font -- digits 0-9 and a colon, just enough to
+// render "HH:MM". No font/text-rendering library exists yet; this is a
+// deliberately tiny hand-encoded table, not a general-purpose one.
 // ---------------------------------------------------------------------
 
-static void eink_test(void) {
+// clang-format off
+static const uint8_t FONT_5X7[11][7] = {
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
+    {0x0E,0x11,0x01,0x0E,0x10,0x10,0x1F}, // 2
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, // 3
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, // 4
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, // 5
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, // 6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, // 7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 8
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
+    {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00}, // 10 = ':'
+};
+// clang-format on
+
+#define CLOCK_GLYPH_SCALE 4
+#define CLOCK_GLYPH_W (5 * CLOCK_GLYPH_SCALE + CLOCK_GLYPH_SCALE) // 5 cols + 1 col gap
+#define CLOCK_GLYPH_H (7 * CLOCK_GLYPH_SCALE)
+#define CLOCK_X0 20
+#define CLOCK_Y0 20
+#define CLOCK_W (5 * CLOCK_GLYPH_W) // "HH:MM" = 5 glyphs
+#define CLOCK_H CLOCK_GLYPH_H
+
+static void draw_glyph(int glyph_index, int x0, int y0, uint8_t color) {
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = FONT_5X7[glyph_index][row];
+        for (int col = 0; col < 5; col++) {
+            if (!((bits >> (4 - col)) & 0x1)) {
+                continue;
+            }
+            for (int sy = 0; sy < CLOCK_GLYPH_SCALE; sy++) {
+                for (int sx = 0; sx < CLOCK_GLYPH_SCALE; sx++) {
+                    EPD_DrawColorPixel(x0 + col * CLOCK_GLYPH_SCALE + sx, y0 + row * CLOCK_GLYPH_SCALE + sy, color);
+                }
+            }
+        }
+    }
+}
+
+// Clears just the clock's own bounding box (not the whole screen) and
+// draws "HH:MM" into it -- used by both the full-seed and the quiet
+// partial-tick paths, so the clock area itself is always redrawn from
+// scratch (the software framebuffer doesn't survive deep sleep either).
+static void draw_clock(int hour, int minute) {
+    for (int y = CLOCK_Y0; y < CLOCK_Y0 + CLOCK_H; y++) {
+        for (int x = CLOCK_X0; x < CLOCK_X0 + CLOCK_W; x++) {
+            EPD_DrawColorPixel(x, y, DRIVER_COLOR_WHITE);
+        }
+    }
+    int glyphs[5] = {hour / 10, hour % 10, 10, minute / 10, minute % 10};
+    for (int i = 0; i < 5; i++) {
+        draw_glyph(glyphs[i], CLOCK_X0 + i * CLOCK_GLYPH_W, CLOCK_Y0, DRIVER_COLOR_BLACK);
+    }
+}
+
+// ---------------------------------------------------------------------
+// E-ink: the SSD1681 loses all internal RAM/LUT state whenever
+// EPD_PWR_PIN is cut, so a genuinely cheap+quiet partial update is only
+// possible if the display stays powered between wakes (see
+// enter_deep_sleep -- it deliberately does NOT power off the EPD).
+// eink_full_seed_with_clock does one full-style refresh (visible flash)
+// that also seeds both of the chip's internal RAM copies, establishing
+// the baseline that later quiet partial ticks diff against.
+// eink_clock_tick assumes that baseline is already valid and does a
+// fast, quiet partial update of just the clock digits.
+// ---------------------------------------------------------------------
+
+static void eink_full_seed_with_clock(int hour, int minute) {
     PortDisplay_Init();
     EPD_Init();
+    // Plain white background, not the old Phase-1 checkerboard smoke-test
+    // pattern -- a high-contrast alternating pattern is close to
+    // worst-case for showing partial-refresh ghosting, and this content
+    // now gets redrawn for real every few minutes rather than once as a
+    // one-off test.
     EPD_Clear();
-    for (int y = 0; y < EPD_HEIGHT; y++) {
-        for (int x = 0; x < EPD_WIDTH; x++) {
-            bool black = ((x / 20) + (y / 20)) % 2 == 0;
-            EPD_DrawColorPixel(x, y, black ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE);
-        }
-    }
-    EPD_Display();
-    ESP_LOGI(TAG, "e-ink full refresh done (checkerboard)");
-
+    draw_clock(hour, minute);
+    // EPD_DisplayPartBaseImage() already performs its own full-quality
+    // visible refresh (via EPD_TurnOnDisplay internally) *and* seeds both
+    // of the chip's internal RAM copies needed for partial diffing --
+    // calling EPD_Display() first as well would refresh the identical
+    // content to the screen twice in a row for no reason.
     EPD_DisplayPartBaseImage();
+    ESP_LOGI(TAG, "e-ink full refresh done (clock)");
+
     EPD_Init_Partial();
-    for (int y = 20; y < 60; y++) {
-        for (int x = 20; x < 60; x++) {
-            EPD_DrawColorPixel(x, y, DRIVER_COLOR_BLACK);
-        }
-    }
+    s_epd_seeded = true;
+    ESP_LOGI(TAG, "e-ink partial mode seeded");
+}
+
+static void eink_clock_tick(int hour, int minute) {
+    // Deep sleep wipes the ESP32's own SPI/GPIO state and the software
+    // framebuffer every wake regardless of what stays externally powered,
+    // so PortDisplay_Init() (ESP32-side re-init only) is still required
+    // here. EPD_Init() must NOT be called, though -- it pulses the
+    // SSD1681's hardware RST line, which would wipe the chip's own
+    // internal RAM/LUT state that we kept it powered specifically to
+    // preserve. The partial LUT loaded by the last EPD_Init_Partial()
+    // (during the last full-seed) is still active in the chip.
+    PortDisplay_Init();
+    draw_clock(hour, minute);
     EPD_DisplayPart();
-    ESP_LOGI(TAG, "e-ink partial refresh done (marker box)");
+    ESP_LOGI(TAG, "e-ink clock tick done (%02d:%02d)", hour, minute);
 }
 
 // ---------------------------------------------------------------------
@@ -432,9 +535,17 @@ static void enter_deep_sleep(void) {
     ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(RTC_INT_PIN));
     ESP_ERROR_CHECK(rtc_gpio_pullup_en(RTC_INT_PIN));
 
-    BoardPower_EPD_OFF();
+    // Deliberately NOT powering off the EPD here (no BoardPower_EPD_OFF):
+    // wakes are only 60s apart now, and the SSD1681 loses all internal
+    // RAM/LUT state the instant it loses power, which would force a full
+    // visible-flash reseed on every single clock tick. Its standby draw
+    // is tiny next to a full refresh or a wifi sync, so leaving it
+    // powered between these short sleeps is the right tradeoff -- but
+    // the EPD power-rail GPIO itself needs the same rtc_gpio_hold_en
+    // treatment as VBAT, or GPIO sleep-isolation could let it float.
     BoardPower_Audio_OFF();
     ESP_ERROR_CHECK(rtc_gpio_hold_en((gpio_num_t)VBAT_PWR_PIN));
+    ESP_ERROR_CHECK(rtc_gpio_hold_en((gpio_num_t)EPD_PWR_PIN));
 
     esp_deep_sleep_start();
 }
@@ -453,85 +564,134 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(nvs_err);
 
-    // VBAT hold survives deep sleep; must release it before we can drive
-    // that GPIO again this cycle.
+    // VBAT and EPD power-rail holds both survive deep sleep; release
+    // before we can drive those GPIOs again this cycle.
     rtc_gpio_hold_dis((gpio_num_t)VBAT_PWR_PIN);
+    rtc_gpio_hold_dis((gpio_num_t)EPD_PWR_PIN);
 
     const char *reset_reason = reset_reason_to_string(esp_reset_reason());
     const char *wake_reason = wake_reason_to_string();
-    ESP_LOGI(TAG, "boot: reset_reason=%s wake_reason=%s", reset_reason, wake_reason);
+
+    // Wakes every ~60s; only every s_ticks_per_sync'th one talks to wifi
+    // and the backend. Always sync on the very first-ever wake (real
+    // power-on) so there's real data immediately instead of waiting.
+    s_wake_tick_count++;
+    bool is_sync_wake = (s_wake_tick_count == 1) || (s_wake_tick_count % (uint32_t)s_ticks_per_sync == 0);
+    ESP_LOGI(TAG, "boot: reset_reason=%s wake_reason=%s tick=%u sync_wake=%d",
+             reset_reason, wake_reason, (unsigned)s_wake_tick_count, is_sync_wake);
 
     BoardPower_Init();
     BoardPower_VBAT_ON();
     BoardPower_EPD_ON();
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    // TZ env state lives in normal RAM and does not survive deep sleep;
+    // re-apply the last-known value every wake so localtime() stays
+    // correct on the lightweight ticks in between real syncs.
+    sync_tz_apply(s_tz_posix, "UTC0");
+
+    // On a quick tick there's nothing else to wait for, so render right
+    // away to minimize wake-to-visible-update latency. A sync wake
+    // deliberately does NOT render yet -- once Phase 2 renders real
+    // snapshot content (checkins/reminders/etc.) here too, rendering
+    // before sync completes would mean a quick clock-only write followed
+    // by a second, fuller write moments later. Render once, after
+    // everything for this cycle is ready, instead.
+    if (!is_sync_wake) {
+        time_t now_epoch = time(nullptr);
+        struct tm local_tm;
+        localtime_r(&now_epoch, &local_tm);
+        if (s_epd_seeded) {
+            eink_clock_tick(local_tm.tm_hour, local_tm.tm_min);
+        } else {
+            eink_full_seed_with_clock(local_tm.tm_hour, local_tm.tm_min);
+        }
+    }
+
     // I2C bus is shared by the RTC and the SHTC3 sensor (the audio codec
     // manages its own separate I2C init internally).
     I2cMasterBus *i2c_bus = I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     pcf85063a_dev_t rtc_dev;
     ESP_ERROR_CHECK(pcf85063a_init(&rtc_dev, i2c_bus->Get_I2cBusHandle(), PCF85063A_ADDRESS));
-    Shtc3_Init(i2c_bus);
 
-    bool wifi_ok = wifi_connect();
+    if (is_sync_wake) {
+        Shtc3_Init(i2c_bus);
 
-    int effective_poll_interval_seconds;
-    if (wifi_ok) {
-        const size_t resp_capacity = 8192;
-        http_response_buf_t resp;
-        resp.data = static_cast<char *>(heap_caps_malloc(resp_capacity, MALLOC_CAP_SPIRAM));
-        resp.capacity = resp_capacity;
-        resp.written = 0;
+        bool wifi_ok = wifi_connect();
 
-        int http_status = 0;
-        bool sync_ok = device_sync(wake_reason, reset_reason, &resp, &http_status);
+        if (wifi_ok) {
+            const size_t resp_capacity = 8192;
+            http_response_buf_t resp;
+            resp.data = static_cast<char *>(heap_caps_malloc(resp_capacity, MALLOC_CAP_SPIRAM));
+            resp.capacity = resp_capacity;
+            resp.written = 0;
 
-        if (sync_ok) {
-            ESP_LOGI(TAG, "/device/sync OK (status %d)", http_status);
-            // sync_snapshot_t is ~8.4KB -- far too large for the 3.5KB main
-            // task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE), so it must live
-            // in heap/PSRAM, not as a stack local.
-            auto *snap = static_cast<sync_snapshot_t *>(heap_caps_malloc(sizeof(sync_snapshot_t), MALLOC_CAP_SPIRAM));
-            if (sync_snapshot_parse(resp.data, snap)) {
-                log_snapshot(*snap);
-                const char *applied_tz = sync_tz_apply(snap->has_timezone_posix ? snap->timezone_posix : nullptr, "UTC0");
-                ESP_LOGI(TAG, "TZ applied: %s", applied_tz ? applied_tz : "(none)");
+            int http_status = 0;
+            bool sync_ok = device_sync(wake_reason, reset_reason, &resp, &http_status);
 
-                if (snap->has_now) {
-                    struct timeval tv = {};
-                    tv.tv_sec = (time_t)snap->now;
-                    settimeofday(&tv, nullptr);
-                    rtc_set_time_utc(&rtc_dev, snap->now);
+            if (sync_ok) {
+                ESP_LOGI(TAG, "/device/sync OK (status %d)", http_status);
+                // sync_snapshot_t is ~8.4KB -- far too large for the 3.5KB
+                // main task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE), so it
+                // must live in heap/PSRAM, not as a stack local.
+                auto *snap = static_cast<sync_snapshot_t *>(heap_caps_malloc(sizeof(sync_snapshot_t), MALLOC_CAP_SPIRAM));
+                if (sync_snapshot_parse(resp.data, snap)) {
+                    log_snapshot(*snap);
+                    if (snap->has_timezone_posix) {
+                        strncpy(s_tz_posix, snap->timezone_posix, sizeof(s_tz_posix) - 1);
+                        s_tz_posix[sizeof(s_tz_posix) - 1] = '\0';
+                    }
+                    const char *applied_tz = sync_tz_apply(s_tz_posix, "UTC0");
+                    ESP_LOGI(TAG, "TZ applied: %s", applied_tz ? applied_tz : "(none)");
+
+                    if (snap->has_now) {
+                        struct timeval tv = {};
+                        tv.tv_sec = (time_t)snap->now;
+                        settimeofday(&tv, nullptr);
+                        rtc_set_time_utc(&rtc_dev, snap->now);
+                    }
+                    // Sync cadence in wake-ticks, derived from the
+                    // server's freshest poll_interval_seconds -- not the
+                    // sleep duration anymore (that's always 60s now).
+                    int poll_interval = snap->has_poll_interval_seconds ? snap->poll_interval_seconds : FALLBACK_POLL_INTERVAL_SECONDS;
+                    s_ticks_per_sync = (poll_interval / 60 > 0) ? (poll_interval / 60) : 1;
+                } else {
+                    ESP_LOGE(TAG, "/device/sync response failed to parse as JSON at all");
                 }
-                effective_poll_interval_seconds = snap->has_poll_interval_seconds ? snap->poll_interval_seconds : FALLBACK_POLL_INTERVAL_SECONDS;
+                heap_caps_free(snap);
             } else {
-                ESP_LOGE(TAG, "/device/sync response failed to parse as JSON at all");
-                effective_poll_interval_seconds = FALLBACK_POLL_INTERVAL_SECONDS;
+                ESP_LOGE(TAG, "/device/sync failed after retries (last status %d)", http_status);
             }
-            heap_caps_free(snap);
-        } else {
-            ESP_LOGE(TAG, "/device/sync failed after retries (last status %d)", http_status);
-            effective_poll_interval_seconds = sync_effective_poll_interval(false, 0, FALLBACK_POLL_INTERVAL_SECONDS);
-        }
 
-        heap_caps_free(resp.data);
-    } else {
-        ESP_LOGE(TAG, "skipping /device/sync -- wifi never connected");
-        effective_poll_interval_seconds = sync_effective_poll_interval(false, 0, FALLBACK_POLL_INTERVAL_SECONDS);
+            heap_caps_free(resp.data);
+        } else {
+            ESP_LOGE(TAG, "skipping /device/sync -- wifi never connected");
+        }
+        // s_ticks_per_sync is deliberately left untouched on any failure
+        // above -- it already holds the last-known-good cadence (or its
+        // own default), so a failed cycle just retries at the next
+        // regularly scheduled sync-wake rather than changing behavior.
+
+        BoardAdc_Init();
+        float vbat = Get_VbatVoltage();
+        ESP_LOGI(TAG, "battery: %.3fV (%.0f%%)", vbat, (double)Get_Batterylevel());
+
+        float temp_c = 0, humidity_pct = 0;
+        Shtc3_ReadTempHumi(&temp_c, &humidity_pct);
+        ESP_LOGI(TAG, "SHTC3: temp=%.1fC humidity=%.1f%%", temp_c, humidity_pct);
+
+        // Single render for this cycle, now that sync (if it succeeded)
+        // has already updated the TZ/RTC above -- see the comment above
+        // the quick-tick branch for why this waits until here.
+        time_t now_epoch = time(nullptr);
+        struct tm local_tm;
+        localtime_r(&now_epoch, &local_tm);
+        eink_full_seed_with_clock(local_tm.tm_hour, local_tm.tm_min);
+
+        audio_loopback_test();
+        sdcard_test();
     }
 
-    BoardAdc_Init();
-    float vbat = Get_VbatVoltage();
-    ESP_LOGI(TAG, "battery: %.3fV (%.0f%%)", vbat, (double)Get_Batterylevel());
-
-    float temp_c = 0, humidity_pct = 0;
-    Shtc3_ReadTempHumi(&temp_c, &humidity_pct);
-    ESP_LOGI(TAG, "SHTC3: temp=%.1fC humidity=%.1f%%", temp_c, humidity_pct);
-
-    eink_test();
-    audio_loopback_test();
-    sdcard_test();
-
-    rtc_schedule_alarm(&rtc_dev, effective_poll_interval_seconds);
+    rtc_schedule_alarm(&rtc_dev);
     enter_deep_sleep();
 }
