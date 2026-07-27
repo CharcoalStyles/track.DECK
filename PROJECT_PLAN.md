@@ -326,7 +326,12 @@ Not in scope for this change: `audio_loopback_test()` also runs unconditionally 
 cycle and is audibly noisy in its own right (records 3s, plays it back through the
 speaker). The complaint that triggered this removal was specifically about the e-ink
 partial refresh, so this is left as-is — worth revisiting in F8 (robustness/power-safety
-pass).
+pass). **Update (2026-07-27, after F6 landed)**: removed entirely. It was a Phase 1
+bring-up smoke test never meant to be permanent, and with F6's real push-to-talk recording
+now proving the mic/codec/speaker path end to end on every voice interaction, the periodic
+3s-record-then-playback on every sync cycle no longer serves a purpose beyond noise —
+confirmed removed and no audio during a normal sync cycle. `BoardPower_Audio_ON()` is now
+only called from the F6 push-to-talk path.
 
 **Verification status**: `idf.py build` clean, host Catch2 suite back to 78 assertions / 20
 cases (confirms removing `sync_poll_interval_to_ticks` didn't break anything else).

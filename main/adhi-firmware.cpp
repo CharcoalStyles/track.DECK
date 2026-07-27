@@ -793,34 +793,6 @@ static void eink_show_message(const char *message) {
 }
 
 // ---------------------------------------------------------------------
-// Audio: real loopback -- record from the mic, play it back.
-// ---------------------------------------------------------------------
-
-static void audio_loopback_test(void) {
-    BoardPower_Audio_ON();
-    Codec_StartInit();
-
-    const int sample_rate = 16000;
-    const int channels = 2;
-    const int seconds = 3;
-    const size_t bytes = (size_t)sample_rate * channels * sizeof(int16_t) * seconds;
-
-    auto *buf = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
-    if (!buf) {
-        ESP_LOGE(TAG, "audio loopback: failed to allocate %u byte buffer", (unsigned)bytes);
-        return;
-    }
-
-    ESP_LOGI(TAG, "recording %ds...", seconds);
-    Codec_RecordData(buf, bytes);
-    ESP_LOGI(TAG, "recording done, playing back...");
-    Codec_PlaybackData(buf, bytes);
-    ESP_LOGI(TAG, "audio loopback done");
-
-    heap_caps_free(buf);
-}
-
-// ---------------------------------------------------------------------
 // SD card: mount, write, read back, verify. Also backs debug logging
 // below -- ensure_sdcard_mounted() is shared so the two don't fight over
 // double-mounting the same card.
@@ -932,10 +904,10 @@ static void enter_deep_sleep(void) {
 // finishes, right before upload), stops on silence or a second BOOT
 // press or a hard duration cap, then uploads and goes straight back to
 // sleep. Deliberately skips the entire normal sync cycle (wifi-connect
-// beforehand, /device/sync, snapshot render, audio_loopback_test,
-// sdcard_test, RTC-alarm rescheduling) -- spec section 4.2 says a sync
-// afterward is optional, not required, and keeping this path lean keeps
-// the whole interaction fast.
+// beforehand, /device/sync, snapshot render, sdcard_test, RTC-alarm
+// rescheduling) -- spec section 4.2 says a sync afterward is optional,
+// not required, and keeping this path lean keeps the whole interaction
+// fast.
 // ---------------------------------------------------------------------
 
 #define PTT_SAMPLE_RATE_HZ 16000
@@ -1393,7 +1365,6 @@ extern "C" void app_main(void) {
         heap_caps_free(snap);
     }
 
-    audio_loopback_test();
     sdcard_test();
 
     int effective_poll_interval = sync_effective_poll_interval(
