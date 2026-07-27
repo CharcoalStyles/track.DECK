@@ -630,14 +630,31 @@ consider (not applied yet, just noted for later discussion).
         mode) in addition to the console. Pull the card to read it directly, no serial
         needed — this is exactly how bugs 2 and 4 above were actually diagnosed. Not
         log-rotated (fine for a debugging session, would need capping for indefinite use).
+  - **Added after initial F6 landing, at the user's request**: the display no longer sits
+        on "SENT"/"UPLOAD FAILED" until the next real sync (which could be minutes away).
+        `eink_render()` now also persists a minimal summary of whatever it drew — just the
+        final computed display values (check-in prompt text, or weather/cloud/soonest-item
+        fields), not the full `sync_snapshot_t` (~8.4KB, far more than the RTC slow memory
+        budget) — into a new `RTC_DATA_ATTR` `s_last_screen` struct. After showing
+        SENT/UPLOAD FAILED for a few seconds, `run_push_to_talk_cycle()` calls the new
+        `eink_render_last_known()` to redraw that same screen from the persisted summary,
+        no wifi/sync involved. Required a small refactor first:
+        `draw_status_bar()`/`draw_checkin()`/`draw_dashboard()` now take plain values
+        instead of a `const sync_snapshot_t&`, and the "soonest upcoming reminder/event"
+        scan was factored out into `find_next_item()` so both the live-render path and the
+        restore-from-summary path share the exact same drawing code. Confirmed on hardware:
+        normal cycle renders and remembers the check-in/dashboard screen, a subsequent PTT
+        interaction shows RECORDING → SENDING → SENT, then correctly restores the
+        previously-remembered screen a few seconds later.
 - **Test**: hardware-confirmed end to end across several flash/test iterations (see the SD
   debug log): recorded a real phrase, stopped via silence and separately via a manual
   second BOOT press, confirmed a `202` and the backend actually processing it (Gotify
   notification), confirmed `one_shot`/`sync` are never sent (not present in
   `upload_voice_note()`'s form fields at all), confirmed a PTT cycle doesn't touch the
-  regular sync/RTC-alarm schedule (no `rtc_schedule_alarm()` call in that path). Not yet
-  independently verified: byte-level inspection of an uploaded `.wav` file confirming
-  genuine mono (downmix logic reviewed and believed correct, but not directly inspected).
+  regular sync/RTC-alarm schedule (no `rtc_schedule_alarm()` call in that path), confirmed
+  the post-PTT screen restore described above. Not yet independently verified: byte-level
+  inspection of an uploaded `.wav` file confirming genuine mono (downmix logic reviewed and
+  believed correct, but not directly inspected).
 - **Backend idea**: none — `voice.py`'s contract already matches the spec precisely.
 
 ### F7. Check-in display + reply/skip flow

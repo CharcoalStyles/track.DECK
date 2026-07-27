@@ -632,7 +632,7 @@ static int draw_wrapped_text(const char *text, int x0, int y0, int max_width_px,
 // is just omitted, not flagged as an error on-screen.
 // ---------------------------------------------------------------------
 
-static void draw_status_bar(const sync_snapshot_t &snap, int battery_pct) {
+static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_pct) {
     char battery_buf[8];
     snprintf(battery_buf, sizeof(battery_buf), "%d%%", battery_pct);
     int battery_w = (int)strlen(battery_buf) * (FONT_GLYPH_W + 1) * 2;
@@ -648,9 +648,9 @@ static void draw_status_bar(const sync_snapshot_t &snap, int battery_pct) {
     // Centered between time (left) and battery (right) -- always shown
     // here regardless of whether a check-in or the dashboard follows
     // below, since it's status-bar-level info either way.
-    if (snap.has_weather) {
+    if (has_weather) {
         char temp_buf[8];
-        snprintf(temp_buf, sizeof(temp_buf), "%.0fC", snap.weather.temperature_c);
+        snprintf(temp_buf, sizeof(temp_buf), "%.0fC", (double)weather_temp_c);
         int temp_w = (int)strlen(temp_buf) * (FONT_GLYPH_W + 1) * 2;
         draw_text(temp_buf, (EPD_WIDTH - temp_w) / 2, 4, 2, DRIVER_COLOR_BLACK);
     }
@@ -672,14 +672,14 @@ static const sync_checkin_t *find_live_checkin(const sync_snapshot_t &snap) {
     return nullptr;
 }
 
-static void draw_checkin(const sync_checkin_t &checkin) {
+static void draw_checkin(const char *prompt_text) {
     draw_text("CHECK-IN", 8, 30, 2, DRIVER_COLOR_BLACK);
     // Body text at scale 1 (not 2) -- prompt_text can run to a full
     // sentence or two, and scale 2 didn't leave enough room to fit it
     // without truncating. Scale 1 fits ~30 chars/line x 15 lines (450
     // chars) well over the 256-char field cap, so truncation shouldn't
     // happen in practice anymore.
-    draw_wrapped_text(checkin.prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
+    draw_wrapped_text(prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
 }
 
 static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
@@ -689,57 +689,68 @@ static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
     snprintf(buf, buf_len, "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
 }
 
-static void draw_dashboard(const sync_snapshot_t &snap) {
-    int y = 30;
+// Soonest upcoming reminder or calendar event, whichever is sooner -- a
+// single combined "next thing" rather than two separate lists, since
+// there's limited vertical space to spend on it. Factored out of
+// draw_dashboard() so the same computed result can also be persisted for
+// eink_render_last_known() below, without needing the raw
+// reminders/calendar_events arrays (which aren't RTC_DATA_ATTR-friendly
+// -- sync_snapshot_t is ~8.4KB, far more than the RTC slow memory budget).
+struct next_item_t {
+    bool have_next;
+    bool is_event;
+    int64_t at;
+    char label[SYNC_STR_TEXT_LEN];
+};
 
-    if (snap.has_weather) {
-        // Temperature is already in the status bar above -- just cloud
-        // cover here, not repeating it.
-        char buf[16];
-        snprintf(buf, sizeof(buf), "CLOUD %d%%", snap.weather.cloud_cover_pct);
-        draw_text(buf, 8, y, 1, DRIVER_COLOR_BLACK);
-        y += 14;
-    }
-
-    // Soonest upcoming reminder or calendar event, whichever is sooner --
-    // a single combined "next thing" rather than two separate lists,
-    // since there's limited vertical space to spend on it.
-    bool have_next = false;
-    int64_t next_at = 0;
-    char next_label[SYNC_STR_TEXT_LEN] = {0};
-    bool next_is_event = false;
+static next_item_t find_next_item(const sync_snapshot_t &snap) {
+    next_item_t result = {};
 
     if (snap.reminders_valid) {
         for (int i = 0; i < snap.reminders_count; i++) {
-            if (!have_next || snap.reminders[i].due_at < next_at) {
-                have_next = true;
-                next_at = snap.reminders[i].due_at;
-                strncpy(next_label, snap.reminders[i].message, sizeof(next_label) - 1);
-                next_label[sizeof(next_label) - 1] = '\0';
-                next_is_event = false;
+            if (!result.have_next || snap.reminders[i].due_at < result.at) {
+                result.have_next = true;
+                result.at = snap.reminders[i].due_at;
+                strncpy(result.label, snap.reminders[i].message, sizeof(result.label) - 1);
+                result.label[sizeof(result.label) - 1] = '\0';
+                result.is_event = false;
             }
         }
     }
     if (snap.calendar_events_valid) {
         for (int i = 0; i < snap.calendar_events_count; i++) {
-            if (!have_next || snap.calendar_events[i].start < next_at) {
-                have_next = true;
-                next_at = snap.calendar_events[i].start;
-                strncpy(next_label, snap.calendar_events[i].summary, sizeof(next_label) - 1);
-                next_label[sizeof(next_label) - 1] = '\0';
-                next_is_event = true;
+            if (!result.have_next || snap.calendar_events[i].start < result.at) {
+                result.have_next = true;
+                result.at = snap.calendar_events[i].start;
+                strncpy(result.label, snap.calendar_events[i].summary, sizeof(result.label) - 1);
+                result.label[sizeof(result.label) - 1] = '\0';
+                result.is_event = true;
             }
         }
     }
+    return result;
+}
 
-    if (have_next) {
+static void draw_dashboard(bool has_weather, int cloud_pct, const next_item_t &next) {
+    int y = 30;
+
+    if (has_weather) {
+        // Temperature is already in the status bar above -- just cloud
+        // cover here, not repeating it.
+        char buf[16];
+        snprintf(buf, sizeof(buf), "CLOUD %d%%", cloud_pct);
+        draw_text(buf, 8, y, 1, DRIVER_COLOR_BLACK);
+        y += 14;
+    }
+
+    if (next.have_next) {
         char time_buf[6];
-        format_local_hhmm(next_at, time_buf, sizeof(time_buf));
+        format_local_hhmm(next.at, time_buf, sizeof(time_buf));
         char header[24];
-        snprintf(header, sizeof(header), "%s %s:", next_is_event ? "EVENT" : "NEXT", time_buf);
+        snprintf(header, sizeof(header), "%s %s:", next.is_event ? "EVENT" : "NEXT", time_buf);
         draw_text(header, 8, y, 1, DRIVER_COLOR_BLACK);
         y += 14;
-        draw_wrapped_text(next_label, 8, y, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
+        draw_wrapped_text(next.label, 8, y, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
     }
 }
 
@@ -762,21 +773,77 @@ static void eink_ensure_initialized(void) {
     }
 }
 
+// Remembers just enough of the last real sync render to redraw the same
+// screen later without a fresh sync (F6's push-to-talk cycle wants to
+// return to "whatever was on screen before" after SENT/UPLOAD FAILED,
+// but e-ink has no undo -- once EPD_Display() overwrites it, the old
+// image is gone unless we redraw it from data we still have). Only the
+// final computed display values are kept, not the raw snapshot (which
+// wouldn't fit in RTC slow memory at ~8.4KB).
+struct last_screen_t {
+    bool valid;
+    bool is_checkin;
+    char checkin_prompt[SYNC_STR_TEXT_LEN];
+    bool has_weather;
+    float weather_temp_c;
+    int weather_cloud_pct;
+    next_item_t next;
+};
+static RTC_DATA_ATTR last_screen_t s_last_screen = {};
+
 static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
     eink_ensure_initialized();
     EPD_Clear();
 
-    draw_status_bar(snap, battery_pct);
+    draw_status_bar(snap.has_weather, (float)snap.weather.temperature_c, battery_pct);
 
     const sync_checkin_t *live_checkin = find_live_checkin(snap);
+    next_item_t next = find_next_item(snap);
     if (live_checkin) {
-        draw_checkin(*live_checkin);
+        draw_checkin(live_checkin->prompt_text);
     } else {
-        draw_dashboard(snap);
+        draw_dashboard(snap.has_weather, snap.weather.cloud_cover_pct, next);
     }
 
     EPD_Display();
     ESP_LOGI(TAG, "e-ink render done (%s)", live_checkin ? "check-in" : "dashboard");
+
+    s_last_screen.valid = true;
+    s_last_screen.is_checkin = (live_checkin != nullptr);
+    if (live_checkin) {
+        strncpy(s_last_screen.checkin_prompt, live_checkin->prompt_text, sizeof(s_last_screen.checkin_prompt) - 1);
+        s_last_screen.checkin_prompt[sizeof(s_last_screen.checkin_prompt) - 1] = '\0';
+    }
+    s_last_screen.has_weather = snap.has_weather;
+    s_last_screen.weather_temp_c = (float)snap.weather.temperature_c;
+    s_last_screen.weather_cloud_pct = snap.weather.cloud_cover_pct;
+    s_last_screen.next = next;
+}
+
+// F6: redraws whatever eink_render() last actually drew, using the
+// persisted summary above -- no wifi/sync involved. Used after a
+// push-to-talk cycle finishes, so the display goes back to the normal
+// screen instead of sitting on "SENT"/"UPLOAD FAILED" until the next
+// real sync (which could be minutes away).
+static void eink_render_last_known(int battery_pct) {
+    if (!s_last_screen.valid) {
+        ESP_LOGW(TAG, "no last-known screen to restore, leaving display as-is");
+        return;
+    }
+
+    eink_ensure_initialized();
+    EPD_Clear();
+
+    draw_status_bar(s_last_screen.has_weather, s_last_screen.weather_temp_c, battery_pct);
+
+    if (s_last_screen.is_checkin) {
+        draw_checkin(s_last_screen.checkin_prompt);
+    } else {
+        draw_dashboard(s_last_screen.has_weather, s_last_screen.weather_cloud_pct, s_last_screen.next);
+    }
+
+    EPD_Display();
+    ESP_LOGI(TAG, "e-ink render done (restored last-known %s)", s_last_screen.is_checkin ? "check-in" : "dashboard");
 }
 
 // F6 (PROJECT_PLAN.md): simple full-refresh status message, reusing the
@@ -1169,6 +1236,9 @@ static void run_push_to_talk_cycle(void) {
     BoardPower_Audio_ON();
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    BoardAdc_Init();
+    int battery_pct = Get_Batterylevel();
+
     // Codec_StartInit() expects the shared I2C bus already up (the
     // normal cycle gets this for free via its own RTC/SHTC3 init before
     // ever touching audio; found missing here via hardware testing --
@@ -1203,6 +1273,11 @@ static void run_push_to_talk_cycle(void) {
         }
         eink_show_message(upload_ok ? "SENT" : "UPLOAD FAILED");
         heap_caps_free(buf);
+
+        // Give the user a moment to actually see the confirmation
+        // before restoring the normal screen underneath it.
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        eink_render_last_known(battery_pct);
     }
 
     // The regular sync cadence is untouched here -- no
