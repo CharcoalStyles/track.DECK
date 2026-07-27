@@ -1,12 +1,64 @@
-# Flash: 4MB, QIO mode
+# Flash: hardware doc says 4MB, but this physical unit (ESP32-S3-PICO-1)
+# actually has 8MB embedded flash. Declaring 4MB produced a "Detected
+# size(8192k) larger than the size in the binary image header" warning
+# every boot -- harmless in itself, but worth correcting to match reality.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
 # PSRAM: Octal SPI PSRAM (V2-specific — not Quad)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 
+# ESP32-S3-PICO-1 SiP + Octal PSRAM: the TRM specifies Octal PSRAM DDR mode
+# uses 64-byte wrap bursts, but the default data cache line is 32 bytes --
+# a documented mismatch that can corrupt PSRAM allocations larger than the
+# 32KB cache footprint on eviction/refill (see
+# github.com/espressif/arduino-esp32 issue #12480, which explicitly calls
+# out the ESP32-S3-PICO-1 SiP as affected). Not the cause of the
+# nvs_flash_init crash chased below (that was a stack overflow in our own
+# code), but a real, independent latent-corruption risk worth closing given
+# we allocate PSRAM buffers well over 32KB (audio loopback, HTTP response).
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# Main task stack: default 3584 bytes is too tight for this app's actual
+# call depth (wifi + HTTP + cJSON + several drivers). Bumped as a safety
+# margin after finding the real Phase-1 bring-up crash: sync_snapshot_t
+# (~8.4KB) was being declared as a stack local in app_main, silently
+# overflowing the stack and corrupting nearby memory -- manifesting as an
+# unrelated-looking crash deep inside nvs_flash_init's cross-core IPC path,
+# with the exact symptom (StoreProhibited / Cache error / LoadProhibited /
+# abort) varying by build depending on what happened to sit next to the
+# overflow. Fixed at the call site by heap/PSRAM-allocating the struct
+# instead of stack-allocating it; this stack bump is defense in depth.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
 # Partition table: single factory app, no OTA slot
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# The home AP runs WPA2/WPA3 mixed ("transition") mode. Per Espressif's own
+# wifi-security docs, the station always prefers WPA3-SAE over WPA2-PSK
+# when an AP advertises both -- setting wifi_config.sta.threshold.authmode
+# does NOT override this (it's a minimum floor, not a cap). Against this
+# specific AP, the SAE handshake was observed failing all retries within a
+# 30s connect window. Disabling SAE support at compile time removes it from
+# consideration entirely, so the station falls back to WPA2-PSK.
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+
+# Confirmed fix: the device was silently resetting (no panic/backtrace
+# printed) right after Codec_PlaybackData() during the audio loopback
+# test, even though the audio audibly played in full -- the default 300ms
+# *interrupt* watchdog (far more aggressive than the 5s task watchdog) was
+# firing on a critical section held too long somewhere in the codec/I2S
+# driver's playback-cleanup path. Loosening both resolved it; confirmed by
+# reaching the SD card test (and beyond) in the next capture.
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=2000
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+
+# SD card: default 8.3 short-filename-only FATFS rejected our test
+# filename ("bringup_test.txt" -- 12-char base name, over the 8-char 8.3
+# limit), failing fopen() with ESP_ERR_NOT_FOUND even though the card
+# mounted fine. The original Waveshare reference examples enable this same
+# setting for their own SD card usage.
+CONFIG_FATFS_LFN_HEAP=y

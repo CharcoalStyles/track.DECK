@@ -143,33 +143,96 @@ pyserial script (without touching DTR/RTS) works as a substitute.
 
 One firmware image, flashed once, that exercises every subsystem in a single boot — not the
 final app behavior (that's Phase 2), just a smoke test proving the toolchain, drivers, and
-backend reachability all work together on real hardware:
+backend reachability all work together on real hardware. All implemented in
+`main/adhi-firmware.cpp`.
 
-- [ ] Wifi STA connect (`06_WIFI_STA` pattern).
-- [ ] `POST /device/sync` against the **real** backend with a hardcoded telemetry body,
-      over HTTPS with `esp_crt_bundle_attach`, `auth` header set from `secrets.h`. Parse
-      the JSON response and log every top-level field.
-- [ ] Apply `timezone.posix` (`setenv`/`tzset`), set the PCF85063 RTC from `now`.
-- [ ] Read battery ADC (`ADC1_CHANNEL_3`), log `battery_mv`.
-- [ ] Read SHTC3 temp/humidity (bonus sensor, not in the spec, but wired and easy to
-      smoke-test here since the I2C bus is already up).
-- [ ] E-ink smoke test: `EPD_Init()` + `EPD_Clear()` + `EPD_Display()` full refresh with a
-      test pattern, then `EPD_Init_Partial()` + `EPD_DisplayPart()` for a partial update.
-- [ ] Audio loopback smoke test: record a few seconds via the ES8311, play it back through
-      the speaker (PA enable GPIO46) — validates mic and speaker independent of the
-      backend `/voice` path.
-- [ ] SD card mount (SDMMC 1-bit) + write/read a test file.
-- [ ] Deep sleep: hold VBAT (GPIO17), enable EXT1 wake on BOOT/PWR/RTC-INT,
-      `esp_deep_sleep_start()`.
-- [ ] On wake: log `esp_sleep_get_wakeup_cause()` / `esp_reset_reason()`, confirming the
-      reset-reason mapping from the spec (§3.1's field table) resolves correctly across a
-      real timer-wake and a real button-wake.
+- [x] Wifi STA connect (`06_WIFI_STA` pattern). **Deviation from spec**: the home AP runs
+      WPA2/WPA3 mixed ("transition") mode, and the station always prefers WPA3-SAE when an
+      AP advertises both — `wifi_config.sta.threshold.authmode` does **not** override this
+      (it's a minimum floor, not a cap; confirmed against Espressif's own docs). The SAE
+      handshake against this specific AP failed all retries within a 30s connect window.
+      Fixed by disabling SAE support entirely at compile time
+      (`CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n` in `sdkconfig.defaults`), forcing WPA2-PSK. Now
+      connects in ~1-4s reliably.
+- [x] `POST /device/sync` against the **real** backend with a hardcoded/boot-state-derived
+      telemetry body (`wake_reason`/`reset_reason` real, computed at boot;
+      `rssi_dbm`/`time_awake_ms` real, cheap to compute; `battery_mv` omitted — reading the
+      real ADC is its own later bullet per the checklist's own ordering). **Deviation from
+      spec**: plain HTTP, not HTTPS — `BACKEND_BASE_URL` is presently a LAN IP
+      (`main/secrets.h`, gitignored), not the HTTPS domain the spec eventually assumes, so
+      no `esp_crt_bundle_attach` needed yet. `auth` header set from `secrets.h`. Bounded
+      retry/backoff via `components/sync_proto`'s `sync_backoff` on failure. Full response
+      parsed via `sync_snapshot_parse`, every top-level field logged. Confirmed against the
+      real backend — full snapshot including a real live check-in.
+- [x] Apply `timezone.posix` (`setenv`/`tzset` via `sync_tz_apply`), set the PCF85063 RTC
+      from `now` (stored as UTC on the chip; POSIX TZ applied separately, never baked into
+      what's stored — see `rtc_set_time_utc`). Confirmed via log:
+      `RTC set from server \`now\` (UTC): 2026-07-27 00:52:30`.
+- [x] Read battery ADC (`ADC1_CHANNEL_3`), log `battery_mv`. Confirmed: `4.114V (99%)`.
+- [x] Read SHTC3 temp/humidity. Confirmed: real temp/humidity logged every cycle.
+- [x] E-ink smoke test: full refresh (checkerboard) then partial refresh (marker box).
+      Confirmed both visually and via log.
+- [x] Audio loopback smoke test: record 3s via the ES8311, play it back through the
+      speaker. Confirmed audible, full clip plays through.
+- [x] SD card mount (SDMMC 1-bit) + write/read a test file. Confirmed by pulling the card
+      and reading `bringup_test.txt` directly — exact expected content, exact expected
+      size.
+- [x] Deep sleep: hold VBAT (GPIO17), enable EXT1 wake on BOOT/PWR/RTC-INT,
+      `esp_deep_sleep_start()`. Confirmed — USB drops (native USB-JTAG loses power in deep
+      sleep) and the backend's next-recorded `reset_reason` reads `deep_sleep_wake`.
+- [x] On wake: log `esp_sleep_get_wakeup_cause()` / `esp_reset_reason()`. Reset-reason
+      mapping and **button wake** confirmed repeatedly (backend recorded
+      `wake_reason: "button"`, `reset_reason: "deep_sleep_wake"`). **RTC-alarm (timer) wake
+      not yet independently confirmed** — every wake exercised so far has been a manual
+      BOOT/PWR press; the alarm is scheduled correctly (`rtc_schedule_alarm`, confirmed via
+      log) but a genuine unprompted timer wake still needs to be observed (leave the device
+      alone for a full `poll_interval_seconds` cycle and check the next `wake_reason`).
 
-**Phase 1 verification**: `idf.py -p <port> flash monitor`. Confirm over serial that each
-step above logs success. Confirm the backend actually received the sync call — check
-`GET /debug/device-state` on the backend (`adhi-backend/main.py:593`) or its logs. Visually
-confirm the e-ink updated. Confirm audio loopback is audible. Physically confirm both an
-RTC-alarm wake and a BOOT-button wake work after a deep sleep cycle.
+**Four real, unrelated bugs found and fixed during bring-up** (all in `sdkconfig.defaults`
+unless noted):
+1. **Stack overflow** (the main crash chased at length): `sync_snapshot_t` (~8.4KB) was
+   declared as a stack local in `app_main`, whose task stack is only 3.5KB
+   (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`, default 3584). Silently overflowed and corrupted
+   nearby memory, manifesting as a completely unrelated-looking crash deep inside
+   `nvs_flash_init`'s cross-core IPC path — exact symptom (`StoreProhibited` / `Cache
+   error` / `LoadProhibited` / `abort`) varied by build depending on what happened to sit
+   next to the overflow. Fixed at the call site in `adhi-firmware.cpp` by
+   heap/PSRAM-allocating the struct instead; stack bumped to 8192 as defense in depth.
+2. **WPA3-SAE vs. this AP's transition mode** — see the wifi bullet above.
+3. **Interrupt watchdog too aggressive for the audio codec's playback-cleanup path** —
+   default 300ms `CONFIG_ESP_INT_WDT_TIMEOUT_MS` was silently resetting the device (no
+   panic/backtrace printed at all) right after `Codec_PlaybackData()`, even though the
+   audio audibly played in full. Loosened to 2000ms (and task WDT to 15s) — confirmed fix
+   by finally seeing `"audio loopback done"` print reliably.
+4. **FATFS 8.3-filename-only** (`CONFIG_FATFS_LFN_NONE` is the ESP-IDF default) rejected
+   `bringup_test.txt` (12-char base name, over the 8-char 8.3 limit) with
+   `ESP_ERR_NOT_FOUND` from `fopen()`, even though the card mounted fine. Fixed with
+   `CONFIG_FATFS_LFN_HEAP=y`, matching what the original Waveshare reference examples
+   already enable for their own SD card usage.
+
+Also incidentally corrected (found while investigating the above, not fixes for any of
+them, but genuine doc/hardware mismatches worth keeping): flash size is actually 8MB on
+this physical unit (ESP32-S3-PICO-1 SiP), not the documented 4MB; and this SiP + Octal
+PSRAM needs a 64-byte data cache line
+(`CONFIG_ESP32S3_DATA_CACHE_LINE_64B`) per a documented TRM mismatch (Octal PSRAM DDR mode
+uses 64-byte wrap bursts) — see `github.com/espressif/arduino-esp32` issue #12480.
+
+**Phase 1 verification**: ✅ Confirmed over serial + the backend's own recorded telemetry
+that every step above logs/behaves correctly. ✅ Backend actually received real sync calls
+(`GET /debug/device-state`, `adhi-backend/main.py:593`). ✅ E-ink updates confirmed
+visually. ✅ Audio loopback confirmed audible. ✅ SD card write/read confirmed by direct
+inspection. ✅ BOOT-button wake confirmed repeatedly. ⬜ RTC-alarm wake — not yet observed
+un-prompted; still needs a real hands-off cycle.
+
+**Flashing note for this board**: its native USB-Serial/JTAG interface doesn't reliably
+auto-exit ROM download mode via software (RTS/DTR toggling) after `idf.py flash` — it
+often needs a physical USB unplug/replug to actually boot the app. The reverse is also
+useful: to force entry into (and stay in) download mode reliably for flashing — instead of
+racing the brief post-wake awake-window before the device returns to deep sleep — hold the
+BOOT button, unplug/replug USB while still holding it, then release BOOT after replugging.
+`idf.py monitor` doesn't work in a non-interactive shell (needs a real TTY); reading
+`/dev/ttyACM0` directly via a small pyserial script (without touching DTR/RTS, with
+auto-reconnect on transient read errors) works as a substitute.
 
 ---
 
