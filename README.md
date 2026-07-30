@@ -1,4 +1,4 @@
-# track.DECK firmware
+# trackDECK firmware
 
 ESP-IDF firmware for a dual-purpose bedside device built on the Waveshare
 ESP32-S3-ePaper-1.54 V2 (non-touch board, ESP32-S3-PICO-1 SiP, Octal PSRAM,
