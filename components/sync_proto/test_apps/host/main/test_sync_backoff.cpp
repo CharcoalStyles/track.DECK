@@ -58,3 +58,50 @@ TEST_CASE("effective poll interval prefers last-known-good over fallback", "[syn
 TEST_CASE("effective poll interval uses fallback when no sync has ever succeeded", "[sync_backoff]") {
     REQUIRE(sync_effective_poll_interval(false, 300, 900) == 900);
 }
+
+TEST_CASE("alarm interval: no future reminder uses the deadline unchanged", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = true; // seed with the opposite to prove it gets set false
+    int interval = sync_effective_alarm_interval_seconds(300, false, 0, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == 300);
+    REQUIRE_FALSE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: a reminder sooner than the deadline wins", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = false;
+    int interval = sync_effective_alarm_interval_seconds(300, true, 60, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == 60);
+    REQUIRE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: a reminder later than the deadline loses to the deadline", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = true;
+    int interval = sync_effective_alarm_interval_seconds(300, true, 900, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == 300);
+    REQUIRE_FALSE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: a near-immediate reminder clamps to min_seconds", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = false;
+    int interval = sync_effective_alarm_interval_seconds(300, true, 1, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == SYNC_MIN_ALARM_INTERVAL_SECONDS);
+    REQUIRE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: a negative seconds-until-reminder also clamps (defensive)", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = false;
+    int interval = sync_effective_alarm_interval_seconds(300, true, -50, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == SYNC_MIN_ALARM_INTERVAL_SECONDS);
+    REQUIRE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: a near-immediate deadline (no reminder) also clamps", "[sync_effective_alarm_interval]") {
+    bool is_reminder_wake = true;
+    int interval = sync_effective_alarm_interval_seconds(1, false, 0, SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+    REQUIRE(interval == SYNC_MIN_ALARM_INTERVAL_SECONDS);
+    REQUIRE_FALSE(is_reminder_wake);
+}
+
+TEST_CASE("alarm interval: out_is_reminder_wake is optional (nullptr doesn't crash)", "[sync_effective_alarm_interval]") {
+    int interval = sync_effective_alarm_interval_seconds(300, true, 60, SYNC_MIN_ALARM_INTERVAL_SECONDS, nullptr);
+    REQUIRE(interval == 60);
+}

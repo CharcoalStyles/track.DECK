@@ -183,3 +183,21 @@ bool sync_snapshot_parse(const char *json_text, sync_snapshot_t *out) {
     cJSON_Delete(root);
     return true;
 }
+
+sync_soonest_reminder_t sync_find_soonest_reminder(const sync_snapshot_t *snap) {
+    sync_soonest_reminder_t result;
+    memset(&result, 0, sizeof(result));
+
+    if (!snap->reminders_valid) {
+        return result;
+    }
+    for (int i = 0; i < snap->reminders_count; i++) {
+        if (!result.have_reminder || snap->reminders[i].due_at < result.due_at) {
+            result.have_reminder = true;
+            result.due_at = snap->reminders[i].due_at;
+            copy_str(result.id, sizeof(result.id), snap->reminders[i].id);
+            copy_str(result.message, sizeof(result.message), snap->reminders[i].message);
+        }
+    }
+    return result;
+}

@@ -768,6 +768,59 @@ consider (not applied yet, just noted for later discussion).
 **Explicit non-goals throughout** (already agreed in `CLAUDE.md`): no OTA, no
 multi-device/fleet concept, no offline queueing/delta sync, no synthesized TTS reply.
 
+### F9. Exact-time reminder wake + chime (2026-07-28)
+- [ ] The device wakes itself at a reminder's exact `due_at` (not just the regular poll
+      interval) and plays a short chime through the speaker — a deliberate, user-requested
+      reversal of CLAUDE.md's original "not the delivery mechanism" framing, scoped to
+      reminders only (check-ins/calendar events remain phone-push-only, unchanged).
+  - **No network sync on a reminder-only wake**: explicitly requested after an initial
+        design draft reused the full wake-sync-render-sleep cycle for every early wake.
+        Revised to a genuine second, lightweight wake path (`handle_reminder_only_wake()`
+        in `adhi-firmware.cpp`) — no wifi, no `/device/sync`, no e-ink draw, no ADC/battery
+        read. Works entirely from a compact `{id, due_at}` reminder cache
+        (`s_pending_reminders[]`) refreshed at the end of every successful full sync.
+  - **Single hardware alarm, two logical wake types**: the PCF85063 only has one wall-clock
+        alarm register, so `s_next_wake_is_reminder_only` (persisted `RTC_DATA_ATTR`) tracks
+        *why* the currently-armed alarm was set, since the chip itself can't say. A shared
+        `schedule_next_wake_and_sleep()` recomputes `min(next full-sync deadline, next
+        cached future reminder due_at)` at the end of both the full-sync cycle and every
+        reminder-only wake, via the new `sync_effective_alarm_interval_seconds()`
+        (`sync_backoff` component, host-unit-tested).
+  - **Chime dedup**: reminders have no `has_fired_at`-style flag (unlike check-ins), so a
+        past-due reminder keeps reappearing in every full-replace snapshot until the
+        backend removes it. `s_last_announced_reminder_id` (persisted) dedups on id — known
+        gap: if a second reminder becomes due the same day before the backend removes the
+        first, only the globally-soonest-due one is guaranteed to chime.
+  - **Sound source**: `play_reminder_chime()` looks for the first `.wav` file in
+        `/sdcard/notesnd/` (skipping dotfiles/macOS `._*` junk), requiring an exact
+        16kHz/16-bit PCM (mono or stereo) match to the codec's opened format — no
+        resampling, mismatches fall back to a generated tone. The fallback
+        (`play_generated_tone_chime()`) synthesizes a sine beep with a slow fade-in (as
+        requested) plus a short fade-out tail to avoid an end-of-buffer click.
+  - **Volume**: a new `Codec_SetPlaybackVolume()` (`port_codec`) sets a dedicated lower
+        chime volume (`CHIME_VOLUME_PERCENT`, starting at 40), distinct from
+        `Codec_StartInit()`'s hardcoded full-volume(100) used by the old audio-loopback
+        bring-up test — this project has explicitly removed other noise sources (the
+        once-a-minute clock-tick refresh, see F2 above) for being too loud for what's meant
+        to be a quiet bedside/desk device.
+  - **Trigger scope**: the chime check only runs on `wake_reason == "timer"` — a PWR-tap
+        "sync now" or the very first boot never chimes, even if a reminder happens to
+        already be due.
+- **Test**: not yet hardware-verified. `idf.py build` clean; host unit tests added for
+  `sync_find_soonest_reminder()` and `sync_effective_alarm_interval_seconds()`
+  (`sync_proto`'s Catch2 suite). Still needed on real hardware: confirm a reminder-only wake
+  shows no wifi-connect log line and never calls `/device/sync`; confirm the chime fires
+  once at the exact due time and not repeatedly on later wakes; confirm audible volume is
+  noticeably quieter than the old full-volume loopback test; confirm a `.wav` dropped in
+  `/sdcard/notesnd/` is picked up over the generated tone; confirm a live check-in
+  suppresses the chime that cycle without losing it permanently; confirm the
+  originally-scheduled full sync still happens on time after one or more reminder-only
+  wakes in between.
+- **Backend idea**: a `has_fired_at`-style flag on reminders (mirroring `sync_checkin_t`)
+  would close the single-id dedup gap noted above — lets firmware (and the dashboard)
+  distinguish "still pending" from "already surfaced" per-reminder instead of just by id
+  recency.
+
 ---
 
 ## Post-Phase-2: battery power-on bug + PWR shutdown (2026-07-27)

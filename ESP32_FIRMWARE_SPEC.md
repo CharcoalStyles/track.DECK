@@ -23,13 +23,17 @@ A dual-purpose device, one physical board:
    to wifi, pulls a 24-hour snapshot of what's coming up (check-ins, reminders, calendar
    events, weather), renders it to the eink display, and goes back to sleep.
 
-**Important framing**: this device is a *display and input surface*, not the delivery
-mechanism. The backend's own scheduler (APScheduler) and push notifications (Gotify, to the
-user's phone) are what actually fire reminders/check-ins/bedtime nudges — that happens
-regardless of whether this device is online, charged, or even exists. If firmware fails to
-sync, or the display shows stale data, that's a degraded UX, not a missed reminder. Build
-firmware with that priority: never let a sync failure, retry loop, or crash burn battery or
-brick the device — worst case is just "the screen is out of date."
+**Important framing**: for check-ins/calendar events/bedtime nudges, this device is a
+*display and input surface*, not the delivery mechanism. The backend's own scheduler
+(APScheduler) and push notifications (Gotify, to the user's phone) are what actually fire
+those — that happens regardless of whether this device is online, charged, or even exists.
+Reminders are the one exception (F9, `PROJECT_PLAN.md`): the device wakes itself at a
+reminder's exact `due_at` and plays a chime through the speaker, independent of the backend's
+own delivery. That reminder-only wake never syncs over the network — it works from a small
+locally-cached `{id, due_at}` list refreshed at the last full sync — so it doesn't change the
+"never let a sync failure/retry loop/crash burn battery or brick the device" priority for
+everything else here: if firmware fails to sync, or the display shows stale data, that's
+still a degraded UX, not a missed reminder.
 
 ## 2. Network & auth
 

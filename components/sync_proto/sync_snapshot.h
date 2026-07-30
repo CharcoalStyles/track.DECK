@@ -91,6 +91,20 @@ typedef struct {
  * validity flag instead of failing the whole parse. */
 bool sync_snapshot_parse(const char *json_text, sync_snapshot_t *out);
 
+typedef struct {
+    bool have_reminder;
+    char id[SYNC_STR_ID_LEN];
+    char message[SYNC_STR_TEXT_LEN];
+    int64_t due_at;
+} sync_soonest_reminder_t;
+
+/* Soonest-due reminder by due_at (past or future -- caller compares
+ * against "now" themselves). Calendar events are deliberately excluded --
+ * only reminders drive the reminder-wake/chime feature, unlike
+ * find_next_item()'s merged reminders+events display logic in the
+ * firmware app itself. */
+sync_soonest_reminder_t sync_find_soonest_reminder(const sync_snapshot_t *snap);
+
 #ifdef __cplusplus
 }
 #endif

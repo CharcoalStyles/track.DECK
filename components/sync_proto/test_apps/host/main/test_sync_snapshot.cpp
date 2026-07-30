@@ -169,3 +169,67 @@ TEST_CASE("empty object parses successfully with everything degraded", "[sync_sn
     REQUIRE_FALSE(snap.calendar_events_valid);
     REQUIRE_FALSE(snap.has_weather);
 }
+
+TEST_CASE("sync_find_soonest_reminder: no reminders section -> have_reminder=false", "[sync_soonest_reminder]") {
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse("{}", &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE_FALSE(soonest.have_reminder);
+}
+
+TEST_CASE("sync_find_soonest_reminder: reminders present but empty array -> have_reminder=false", "[sync_soonest_reminder]") {
+    const char *json = R"({"reminders": []})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE(snap.reminders_valid);
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE_FALSE(soonest.have_reminder);
+}
+
+TEST_CASE("sync_find_soonest_reminder: single reminder", "[sync_soonest_reminder]") {
+    const char *json = R"({
+      "reminders": [
+        {"id": "r1", "message": "Take pills", "due_at": 1000}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE(soonest.have_reminder);
+    REQUIRE(std::string(soonest.id) == "r1");
+    REQUIRE(std::string(soonest.message) == "Take pills");
+    REQUIRE(soonest.due_at == 1000);
+}
+
+TEST_CASE("sync_find_soonest_reminder: picks the smallest due_at among several", "[sync_soonest_reminder]") {
+    const char *json = R"({
+      "reminders": [
+        {"id": "r1", "message": "later", "due_at": 5000},
+        {"id": "r2", "message": "soonest", "due_at": 1000},
+        {"id": "r3", "message": "middle", "due_at": 3000}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE(soonest.have_reminder);
+    REQUIRE(std::string(soonest.id) == "r2");
+    REQUIRE(soonest.due_at == 1000);
+}
+
+TEST_CASE("sync_find_soonest_reminder: calendar events are ignored, only reminders count", "[sync_soonest_reminder]") {
+    const char *json = R"({
+      "reminders": [
+        {"id": "r1", "message": "the only reminder", "due_at": 5000}
+      ],
+      "calendar_events": [
+        {"uid": "e1", "summary": "earlier but not a reminder", "start": 100}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE(soonest.have_reminder);
+    REQUIRE(std::string(soonest.id) == "r1");
+    REQUIRE(soonest.due_at == 5000);
+}

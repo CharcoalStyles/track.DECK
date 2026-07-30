@@ -11,6 +11,7 @@ void Codec_StartInit();
 
 esp_err_t Codec_PlaybackData(uint8_t *buffer,size_t bytes);
 esp_err_t Codec_RecordData(uint8_t *buffer,size_t bytes);
+esp_err_t Codec_SetPlaybackVolume(int vol_percent);
 
 #ifdef __cplusplus
 }

@@ -33,6 +33,22 @@ uint32_t sync_backoff_delay_ms(const sync_backoff_t *b);
  * the last-known-good value if one exists, else a hardcoded fallback. */
 int sync_effective_poll_interval(bool has_last_known_good, int last_known_good_seconds, int fallback_seconds);
 
+/* Floor on the scheduled alarm interval -- the RTC alarm write needs time
+ * to actually take effect and the device still needs to get to sleep, so
+ * the alarm is never scheduled for "now" or the past. */
+#define SYNC_MIN_ALARM_INTERVAL_SECONDS 5
+
+/* Decides the next sleep interval: seconds_until_next_deadline (the normal
+ * sync/poll deadline), or seconds_until_reminder if a future reminder is
+ * sooner. Floored at min_seconds either way. *out_is_reminder_wake reports
+ * which one won, so the caller can persist whether its next "timer" wake
+ * should take the lightweight reminder-only path or a full sync. */
+int sync_effective_alarm_interval_seconds(int seconds_until_next_deadline,
+                                           bool have_future_reminder,
+                                           int64_t seconds_until_reminder,
+                                           int min_seconds,
+                                           bool *out_is_reminder_wake);
+
 #ifdef __cplusplus
 }
 #endif

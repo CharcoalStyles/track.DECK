@@ -53,6 +53,14 @@ esp_err_t Codec_PlaybackData(uint8_t *buffer,size_t bytes) {
 	return esp_codec_dev_write(playback, buffer, bytes);
 }
 
+// Overrides Codec_StartInit()'s hardcoded full-volume(100) default -- used
+// by the reminder chime, which needs a much quieter level than the
+// full-volume audio-loopback bring-up test this codec was originally
+// wired up for.
+esp_err_t Codec_SetPlaybackVolume(int vol_percent) {
+	return esp_codec_dev_set_out_vol(playback, vol_percent);
+}
+
 esp_err_t Codec_RecordData(uint8_t *buffer,size_t bytes) {
 	return esp_codec_dev_read(record, buffer, bytes);
 }

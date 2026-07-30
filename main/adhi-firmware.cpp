@@ -13,6 +13,8 @@
 #include <ctime>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <strings.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -20,6 +22,7 @@
 
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_random.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
@@ -74,6 +77,12 @@ static const char *TAG = "bringup";
 // connect timeout below instead of exhausting around 15-20s.
 #define WIFI_MAX_RETRY 10
 #define FALLBACK_POLL_INTERVAL_SECONDS 300
+
+// CLAUDE.md's "Firmware versioning" section: bump at least once before
+// every commit that changes main/ or components/ source, in the same
+// commit as the change itself -- this is the single point of truth for
+// both /device/sync and /device/error, so bumping here covers both.
+#define FIRMWARE_VERSION "0.3.0-device-error"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -343,6 +352,100 @@ static int get_rssi_dbm(void) {
 }
 
 // ---------------------------------------------------------------------
+// POST /device/error -- best-effort error reporting. Recording an error
+// (record_device_error()) never touches the network, so it's safe to
+// call from anywhere, including code paths that run with no wifi at all
+// (chime playback during F9's reminder-only wake, or an SD mount
+// failure before wifi is even attempted this boot). Actually sending it
+// (flush_pending_device_error()) happens once per cycle, only after
+// wifi is confirmed up.
+// ---------------------------------------------------------------------
+
+// Single-slot pending report, persisted across deep sleep so it survives
+// however many network-free wakes happen before the next one with wifi.
+// Only the most recent error is kept if several occur first -- same
+// "single slot, not a queue" tradeoff already accepted for
+// s_last_announced_reminder_id (F9) elsewhere in this file.
+#define DEVICE_ERROR_TYPE_LEN 32
+#define DEVICE_ERROR_MESSAGE_LEN 128
+static RTC_DATA_ATTR bool s_pending_error = false;
+static RTC_DATA_ATTR char s_pending_error_type[DEVICE_ERROR_TYPE_LEN] = "";
+static RTC_DATA_ATTR char s_pending_error_message[DEVICE_ERROR_MESSAGE_LEN] = "";
+
+static void record_device_error(const char *error_type, const char *message) {
+    s_pending_error = true;
+    strncpy(s_pending_error_type, error_type, sizeof(s_pending_error_type) - 1);
+    s_pending_error_type[sizeof(s_pending_error_type) - 1] = '\0';
+    if (message) {
+        strncpy(s_pending_error_message, message, sizeof(s_pending_error_message) - 1);
+        s_pending_error_message[sizeof(s_pending_error_message) - 1] = '\0';
+    } else {
+        s_pending_error_message[0] = '\0';
+    }
+    ESP_LOGW(TAG, "device error recorded (pending report): %s: %s", error_type, s_pending_error_message);
+}
+
+// One best-effort attempt -- unlike device_sync(), no bounded-retry loop
+// within the cycle; a failure here just leaves s_pending_error set for
+// flush_pending_device_error()'s caller to try again next time wifi is up.
+static bool send_device_error(const char *error_type, const char *message, const char *reset_reason,
+                               const char *wake_reason, int battery_mv, int battery_pct) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "error_type", error_type);
+    cJSON_AddStringToObject(root, "message", message ? message : "");
+    cJSON_AddStringToObject(root, "firmware_version", FIRMWARE_VERSION);
+    cJSON_AddStringToObject(root, "reset_reason", reset_reason);
+    cJSON_AddStringToObject(root, "wake_reason", wake_reason);
+    cJSON_AddNumberToObject(root, "battery_mv", battery_mv);
+    cJSON_AddNumberToObject(root, "battery_pct", battery_pct);
+    cJSON_AddNumberToObject(root, "rssi_dbm", get_rssi_dbm());
+    cJSON_AddNumberToObject(root, "free_internal_heap_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    char *body = cJSON_PrintUnformatted(root);
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/device/error", BACKEND_BASE_URL);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 10000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "auth", API_TOKEN);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        ok = (status >= 200 && status < 300);
+        if (!ok) {
+            ESP_LOGW(TAG, "/device/error POST returned status %d", status);
+        }
+    } else {
+        ESP_LOGW(TAG, "/device/error POST failed: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+    cJSON_free(body);
+    cJSON_Delete(root);
+    return ok;
+}
+
+// Called once per cycle after wifi is confirmed up. Sends whatever error
+// is pending (possibly recorded on an earlier network-free wake) and
+// only clears it on success -- a failed report just retries next time.
+static void flush_pending_device_error(const char *reset_reason, const char *wake_reason, int battery_mv, int battery_pct) {
+    if (!s_pending_error) {
+        return;
+    }
+    bool ok = send_device_error(s_pending_error_type, s_pending_error_message, reset_reason, wake_reason, battery_mv, battery_pct);
+    if (ok) {
+        s_pending_error = false;
+    }
+}
+
+// ---------------------------------------------------------------------
 // POST /device/sync
 // ---------------------------------------------------------------------
 
@@ -350,6 +453,7 @@ struct http_response_buf_t {
     char *data;
     size_t capacity;
     size_t written;
+    bool truncated; // set if a chunk had to be clamped -- response exceeded capacity
 };
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
@@ -359,18 +463,28 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
             size_t copy_len = evt->data_len;
             if (copy_len > buf->capacity - 1 - buf->written) {
                 copy_len = buf->capacity - 1 - buf->written;
+                buf->truncated = true;
             }
             memcpy(buf->data + buf->written, evt->data, copy_len);
             buf->written += copy_len;
             buf->data[buf->written] = '\0';
+        } else if (buf && evt->data_len > 0) {
+            // Buffer was already full when this chunk arrived -- still
+            // truncated, just nothing left to clamp/copy.
+            buf->truncated = true;
         }
     }
     return ESP_OK;
 }
 
-// One attempt at POST /device/sync. Returns true on a 2xx response.
+// One attempt at POST /device/sync. Returns true on a 2xx response that
+// wasn't truncated -- a truncated response is treated as a failed
+// attempt regardless of HTTP status, since handing partial JSON to
+// sync_snapshot_parse() would silently degrade every section, not just
+// the one that happened to push the response over capacity.
 static bool device_sync_attempt(const char *request_body, http_response_buf_t *resp, int *out_status) {
     resp->written = 0;
+    resp->truncated = false;
     resp->data[0] = '\0';
 
     char url[256];
@@ -393,6 +507,12 @@ static bool device_sync_attempt(const char *request_body, http_response_buf_t *r
     if (err == ESP_OK) {
         *out_status = esp_http_client_get_status_code(client);
         ok = (*out_status >= 200 && *out_status < 300);
+        if (ok && resp->truncated) {
+            ESP_LOGE(TAG, "/device/sync response truncated at %u bytes (capacity %u) -- treating as failed attempt",
+                     (unsigned)resp->written, (unsigned)resp->capacity);
+            record_device_error("sync_response_truncated", "response exceeded resp_capacity");
+            ok = false;
+        }
     } else {
         ESP_LOGE(TAG, "http_client_perform failed: %s", esp_err_to_name(err));
         *out_status = -1;
@@ -410,7 +530,7 @@ static bool device_sync_attempt(const char *request_body, http_response_buf_t *r
 static bool device_sync(const char *wake_reason, const char *reset_reason, int battery_mv, int64_t time_awake_ms, http_response_buf_t *resp, int *out_status) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "wake_reason", wake_reason);
-    cJSON_AddStringToObject(root, "firmware_version", "0.2.0-f1");
+    cJSON_AddStringToObject(root, "firmware_version", FIRMWARE_VERSION);
     cJSON_AddNumberToObject(root, "battery_mv", battery_mv);
     cJSON_AddNumberToObject(root, "rssi_dbm", get_rssi_dbm());
     cJSON_AddNumberToObject(root, "time_awake_ms", (double)time_awake_ms);
@@ -675,12 +795,20 @@ static int draw_wrapped_text(const char *text, int x0, int y0, int max_width_px,
 // is just omitted, not flagged as an error on-screen.
 // ---------------------------------------------------------------------
 
+static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
+    time_t t = (time_t)epoch;
+    struct tm local_tm;
+    localtime_r(&t, &local_tm);
+    snprintf(buf, buf_len, "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
+}
+
 // F8: notice is non-null only when this cycle's sync failed -- drawn in
 // place of the plain divider line (same row, y=22) rather than adding a
 // new one, since a scale-1 text line (7px tall) fits in the same space
 // without disturbing anything above (status bar text, y=4-18) or below
-// (body content starts at y=30).
-static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_pct, const char *notice) {
+// (cloud+rain row at y=28, sunrise/sunset row at y=37, second divider at
+// y=48, body content starts at y=54).
+static void draw_status_bar(bool has_weather, const sync_weather_t &weather, int battery_pct, const char *notice) {
     char battery_buf[8];
     snprintf(battery_buf, sizeof(battery_buf), "%d%%", battery_pct);
     int battery_w = (int)strlen(battery_buf) * (FONT_GLYPH_W + 1) * 2;
@@ -698,7 +826,7 @@ static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_
     // below, since it's status-bar-level info either way.
     if (has_weather) {
         char temp_buf[8];
-        snprintf(temp_buf, sizeof(temp_buf), "%.0fC", (double)weather_temp_c);
+        snprintf(temp_buf, sizeof(temp_buf), "%.0fC", (double)weather.temperature_c);
         int temp_w = (int)strlen(temp_buf) * (FONT_GLYPH_W + 1) * 2;
         draw_text(temp_buf, (EPD_WIDTH - temp_w) / 2, 4, 2, DRIVER_COLOR_BLACK);
     }
@@ -709,6 +837,26 @@ static void draw_status_bar(bool has_weather, float weather_temp_c, int battery_
         for (int x = 4; x < EPD_WIDTH - 4; x++) {
             EPD_DrawColorPixel(x, 22, DRIVER_COLOR_BLACK);
         }
+    }
+
+    // Second/third header rows: cloud cover + rain, then sunrise/sunset --
+    // same on every screen (check-in included) since it's status-bar-level
+    // info now, not dashboard-only.
+    if (has_weather) {
+        char cloud_buf[24];
+        snprintf(cloud_buf, sizeof(cloud_buf), "CLOUD %d%%  RAIN %.1fMM", weather.cloud_cover_pct, weather.precipitation_mm);
+        draw_text(cloud_buf, 8, 28, 1, DRIVER_COLOR_BLACK);
+
+        char sunrise_buf[6], sunset_buf[6];
+        format_local_hhmm(weather.sunrise, sunrise_buf, sizeof(sunrise_buf));
+        format_local_hhmm(weather.sunset, sunset_buf, sizeof(sunset_buf));
+        char sun_buf[20];
+        snprintf(sun_buf, sizeof(sun_buf), "SUN %s-%s", sunrise_buf, sunset_buf);
+        draw_text(sun_buf, 8, 37, 1, DRIVER_COLOR_BLACK);
+    }
+
+    for (int x = 4; x < EPD_WIDTH - 4; x++) {
+        EPD_DrawColorPixel(x, 48, DRIVER_COLOR_BLACK);
     }
 }
 
@@ -725,20 +873,14 @@ static const sync_checkin_t *find_live_checkin(const sync_snapshot_t &snap) {
 }
 
 static void draw_checkin(const char *prompt_text) {
-    draw_text("CHECK-IN", 8, 30, 2, DRIVER_COLOR_BLACK);
+    draw_text("CHECK-IN", 8, 54, 2, DRIVER_COLOR_BLACK);
     // Body text at scale 1 (not 2) -- prompt_text can run to a full
     // sentence or two, and scale 2 didn't leave enough room to fit it
-    // without truncating. Scale 1 fits ~30 chars/line x 15 lines (450
+    // without truncating. Scale 1 fits ~30 chars/line x 14 lines (420
     // chars) well over the 256-char field cap, so truncation shouldn't
-    // happen in practice anymore.
-    draw_wrapped_text(prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
-}
-
-static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
-    time_t t = (time_t)epoch;
-    struct tm local_tm;
-    localtime_r(&t, &local_tm);
-    snprintf(buf, buf_len, "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
+    // happen in practice anymore. Capped at 14 (not 15) so the last line
+    // can't land past y=200 (screen bottom) and get silently dropped.
+    draw_wrapped_text(prompt_text, 8, 74, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 14);
 }
 
 // Soonest upcoming reminder or calendar event, whichever is sooner -- a
@@ -783,25 +925,16 @@ static next_item_t find_next_item(const sync_snapshot_t &snap) {
     return result;
 }
 
-static void draw_dashboard(bool has_weather, int cloud_pct, const next_item_t &next) {
-    int y = 30;
-
-    if (has_weather) {
-        // Temperature is already in the status bar above -- just cloud
-        // cover here, not repeating it.
-        char buf[16];
-        snprintf(buf, sizeof(buf), "CLOUD %d%%", cloud_pct);
-        draw_text(buf, 8, y, 1, DRIVER_COLOR_BLACK);
-        y += 14;
-    }
+static void draw_dashboard(const next_item_t &next) {
+    int y = 54;
 
     if (next.have_next) {
         char time_buf[6];
         format_local_hhmm(next.at, time_buf, sizeof(time_buf));
         char header[24];
         snprintf(header, sizeof(header), "%s %s:", next.is_event ? "EVENT" : "NEXT", time_buf);
-        draw_text(header, 8, y, 1, DRIVER_COLOR_BLACK);
-        y += 14;
+        draw_text(header, 8, y, 2, DRIVER_COLOR_BLACK);
+        y += 20;
         draw_wrapped_text(next.label, 8, y, EPD_WIDTH - 16, 2, DRIVER_COLOR_BLACK, 4);
     }
 }
@@ -838,41 +971,98 @@ struct last_screen_t {
     char checkin_prompt[SYNC_STR_TEXT_LEN];
     char checkin_id[SYNC_STR_ID_LEN]; // F7: needed for voice-reply tagging and skip
     bool has_weather;
-    float weather_temp_c;
-    int weather_cloud_pct;
+    sync_weather_t weather; // ~52 bytes -- fine for RTC slow memory, unlike the full snapshot
     next_item_t next;
 };
 static RTC_DATA_ATTR last_screen_t s_last_screen = {};
 
-static void eink_render(const sync_snapshot_t &snap, int battery_pct) {
+// F9: reminder wake + chime state, all persisted across deep-sleep cycles.
+// A compact {id, message, due_at} cache (not the full sync_reminder_t,
+// which also carries event_uid[40] -- unneeded here) refreshed from every
+// successful sync, so a reminder-only wake (see
+// handle_reminder_only_wake() below) can decide what to do -- including
+// what to draw if it needs to override a live check-in on screen --
+// without a fresh network fetch.
+typedef struct {
+    char id[SYNC_STR_ID_LEN];
+    char message[SYNC_STR_TEXT_LEN];
+    int64_t due_at;
+} reminder_wake_entry_t;
+static RTC_DATA_ATTR reminder_wake_entry_t s_pending_reminders[SYNC_MAX_REMINDERS];
+static RTC_DATA_ATTR int s_pending_reminders_count = 0;
+
+// When the next real sync is owed (epoch seconds); 0 until the first
+// successful sync. Fixed at the end of every full-sync cycle and left
+// untouched across any number of intervening reminder-only wakes.
+static RTC_DATA_ATTR int64_t s_next_full_sync_at = 0;
+
+// Whether the alarm currently armed was set for an upcoming reminder's
+// exact due_at (true) rather than the regular sync deadline (false). The
+// PCF85063 has only one hardware alarm register and can't tell firmware
+// *why* it fired -- this is how app_main tells a reminder-only "timer"
+// wake apart from a normal poll-interval one.
+static RTC_DATA_ATTR bool s_next_wake_is_reminder_only = false;
+
+// Dedups chiming across wake cycles. Snapshots are always a full replace
+// with no "fired"/"dismissed" flag on reminders (unlike sync_checkin_t's
+// has_fired_at), so a reminder with a past due_at keeps reappearing in
+// every snapshot until the backend actually removes it. Persisting just
+// the last-announced id (not a set) means: if a second reminder becomes
+// due the same day before the backend removes the first, only the
+// earliest-due one is guaranteed to chime until it's removed from the
+// snapshot -- accepted limitation, see PROJECT_PLAN.md's F9 entry.
+static RTC_DATA_ATTR char s_last_announced_reminder_id[SYNC_STR_ID_LEN] = "";
+
+// F9: override_reminder is non-null only when handle_due_reminder() just
+// fired this cycle -- a reminder that just activated always takes over
+// the screen from a live check-in, unconditionally. Built directly from
+// override_reminder rather than reused from find_next_item()'s own scan
+// (which merges reminders+calendar events and could in principle land on
+// a different item) so what's drawn always matches what actually chimed.
+static void eink_render(const sync_snapshot_t &snap, int battery_pct, const sync_soonest_reminder_t *override_reminder) {
     eink_ensure_initialized();
     EPD_Clear();
 
-    draw_status_bar(snap.has_weather, (float)snap.weather.temperature_c, battery_pct, nullptr);
+    draw_status_bar(snap.has_weather, snap.weather, battery_pct, nullptr);
 
     const sync_checkin_t *live_checkin = find_live_checkin(snap);
     next_item_t next = find_next_item(snap);
-    if (live_checkin) {
+
+    next_item_t reminder_item = {};
+    if (override_reminder) {
+        reminder_item.have_next = true;
+        reminder_item.is_event = false;
+        reminder_item.at = override_reminder->due_at;
+        strncpy(reminder_item.label, override_reminder->message, sizeof(reminder_item.label) - 1);
+        reminder_item.label[sizeof(reminder_item.label) - 1] = '\0';
+    }
+
+    const char *render_kind;
+    if (override_reminder) {
+        draw_dashboard(reminder_item);
+        render_kind = "reminder-override";
+    } else if (live_checkin) {
         draw_checkin(live_checkin->prompt_text);
+        render_kind = "check-in";
     } else {
-        draw_dashboard(snap.has_weather, snap.weather.cloud_cover_pct, next);
+        draw_dashboard(next);
+        render_kind = "dashboard";
     }
 
     EPD_Display();
-    ESP_LOGI(TAG, "e-ink render done (%s)", live_checkin ? "check-in" : "dashboard");
+    ESP_LOGI(TAG, "e-ink render done (%s)", render_kind);
 
     s_last_screen.valid = true;
-    s_last_screen.is_checkin = (live_checkin != nullptr);
-    if (live_checkin) {
+    s_last_screen.is_checkin = (!override_reminder && live_checkin != nullptr);
+    if (s_last_screen.is_checkin) {
         strncpy(s_last_screen.checkin_prompt, live_checkin->prompt_text, sizeof(s_last_screen.checkin_prompt) - 1);
         s_last_screen.checkin_prompt[sizeof(s_last_screen.checkin_prompt) - 1] = '\0';
         strncpy(s_last_screen.checkin_id, live_checkin->id, sizeof(s_last_screen.checkin_id) - 1);
         s_last_screen.checkin_id[sizeof(s_last_screen.checkin_id) - 1] = '\0';
     }
     s_last_screen.has_weather = snap.has_weather;
-    s_last_screen.weather_temp_c = (float)snap.weather.temperature_c;
-    s_last_screen.weather_cloud_pct = snap.weather.cloud_cover_pct;
-    s_last_screen.next = next;
+    s_last_screen.weather = snap.weather;
+    s_last_screen.next = override_reminder ? reminder_item : next;
 }
 
 // F6/F8: redraws whatever eink_render() last actually drew, using the
@@ -890,14 +1080,13 @@ static void eink_render_last_known(int battery_pct, const char *notice) {
     EPD_Clear();
 
     bool has_weather = s_last_screen.valid && s_last_screen.has_weather;
-    float weather_temp_c = s_last_screen.valid ? s_last_screen.weather_temp_c : 0.0f;
-    draw_status_bar(has_weather, weather_temp_c, battery_pct, notice);
+    draw_status_bar(has_weather, s_last_screen.weather, battery_pct, notice);
 
     if (s_last_screen.valid) {
         if (s_last_screen.is_checkin) {
             draw_checkin(s_last_screen.checkin_prompt);
         } else {
-            draw_dashboard(s_last_screen.has_weather, s_last_screen.weather_cloud_pct, s_last_screen.next);
+            draw_dashboard(s_last_screen.next);
         }
     }
 
@@ -928,8 +1117,8 @@ static void eink_show_message(const char *message) {
 static void eink_show_checkin_recording(const char *prompt_text) {
     eink_ensure_initialized();
     EPD_Clear();
-    draw_text("REPLYING...", 8, 30, 2, DRIVER_COLOR_BLACK);
-    draw_wrapped_text(prompt_text, 8, 50, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 15);
+    draw_text("REPLYING...", 8, 54, 2, DRIVER_COLOR_BLACK);
+    draw_wrapped_text(prompt_text, 8, 74, EPD_WIDTH - 16, 1, DRIVER_COLOR_BLACK, 14);
     EPD_Display();
     ESP_LOGI(TAG, "e-ink message shown: replying to check-in");
 }
@@ -942,6 +1131,7 @@ static void eink_show_checkin_recording(const char *prompt_text) {
 
 static bool s_sdcard_mounting_in_progress = false;
 static bool s_sdcard_mounted = false;
+static bool s_sdcard_mount_error_reported_this_boot = false;
 
 // Retries on every call until it actually succeeds -- needed because the
 // SD card can't be mounted until BoardPower_VBAT_ON() has powered its
@@ -963,6 +1153,16 @@ static bool ensure_sdcard_mounted(void) {
     s_sdcard_mounting_in_progress = true;
     s_sdcard_mounted = Sdcard_Init();
     s_sdcard_mounting_in_progress = false;
+    if (!s_sdcard_mounted && !s_sdcard_mount_error_reported_this_boot) {
+        // Set before recording -- record_device_error() itself logs,
+        // which (if SD_DEBUG_LOG_ENABLED) can re-enter this function via
+        // sd_log_vprintf(). That reentrant call is harmless on its own
+        // (this function already supports being called repeatedly, per
+        // the comment above), but this flag stops it from recording a
+        // second time and log-looping.
+        s_sdcard_mount_error_reported_this_boot = true;
+        record_device_error("sdcard_mount_failed", "Sdcard_Init() returned false");
+    }
     return s_sdcard_mounted;
 }
 
@@ -1158,6 +1358,400 @@ static wav_header_t build_wav_header(uint32_t sample_rate, uint16_t num_channels
     memcpy(hdr.data_tag, "data", 4);
     hdr.data_length = data_length;
     return hdr;
+}
+
+// ---------------------------------------------------------------------
+// F9: reminder chime. SD card WAV lookup (components/port_bsp's
+// ensure_sdcard_mounted() is already used elsewhere in this file) with a
+// generated-tone fallback -- no sound asset shipped with the firmware,
+// the user drops their own .wav files on the card if/when they have any.
+// ---------------------------------------------------------------------
+
+#define CHIME_DIR SDlist "/notesnd"
+#define CHIME_SAMPLE_RATE_HZ 16000 // must match Codec_StartInit()'s opened format
+#define CHIME_CHANNELS 2           // codec is opened fixed-stereo regardless of source
+#define CHIME_BYTES_PER_SAMPLE 2
+#define CHIME_IO_CHUNK_FRAMES 1024 // frames per read/write chunk (1 frame = 1 sample per channel)
+#define CHIME_VOLUME_PERCENT 40    // starting point -- tune after hearing it on hardware;
+                                    // deliberately below Codec_StartInit()'s full-volume(100)
+                                    // default, which is a quiet bedside/desk device (see
+                                    // PROJECT_PLAN.md's clock-tick-noise removal notes)
+#define CHIME_TONE_FREQ_HZ 880.0
+#define CHIME_TONE_DURATION_MS 700
+#define CHIME_TONE_FADE_IN_FRACTION 0.6 // the requested "slow ramp-up"
+#define CHIME_TONE_FADE_OUT_MS 60       // short tail, avoids a click at buffer end
+#define CHIME_TONE_AMPLITUDE 0.6        // headroom below full-scale
+
+// Usable chime candidate: a ".wav" file, not a dotfile/".."/macOS "._*"
+// AppleDouble junk that Finder writes when copying to SD cards.
+static bool is_usable_wav_filename(const char *name) {
+    if (name[0] == '.') {
+        return false;
+    }
+    size_t name_len = strlen(name);
+    return name_len >= 4 && strcasecmp(name + name_len - 4, ".wav") == 0;
+}
+
+// Picks uniformly at random among every usable ".wav" file under
+// CHIME_DIR, so repeated chimes don't always play the same sound once
+// more than one is present. Two passes -- first counts usable entries,
+// second re-scans and returns the one at a randomly chosen index --
+// rather than collecting names into an array, keeping memory use bounded
+// regardless of how large the folder grows. readdir() order is stable
+// across the two back-to-back scans since nothing else writes to this
+// directory mid-chime. False (silent fallback to the generated tone) if
+// the directory doesn't exist or has no usable entry -- this is an
+// expected, not an error, state (matches this file's "degrade
+// independently" pattern elsewhere).
+static bool find_random_wav_in_notesnd(char *out_path, size_t out_path_len) {
+    DIR *dir = opendir(CHIME_DIR);
+    if (!dir) {
+        return false;
+    }
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (is_usable_wav_filename(entry->d_name)) {
+            count++;
+        }
+    }
+    closedir(dir);
+    if (count == 0) {
+        return false;
+    }
+
+    int target = (int)(esp_random() % (uint32_t)count);
+
+    dir = opendir(CHIME_DIR);
+    if (!dir) {
+        return false; // pathological: directory vanished between the two passes
+    }
+    bool found = false;
+    int i = 0;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (!is_usable_wav_filename(entry->d_name)) {
+            continue;
+        }
+        if (i == target) {
+            snprintf(out_path, out_path_len, "%s/%s", CHIME_DIR, entry->d_name);
+            found = true;
+            break;
+        }
+        i++;
+    }
+    closedir(dir);
+    return found;
+}
+
+struct wav_fmt_info_t {
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint16_t bits_per_sample;
+    uint32_t sample_rate;
+    long data_offset;
+    uint32_t data_length;
+};
+
+// Minimal RIFF/WAVE chunk walker -- just enough to locate `fmt ` and
+// `data`, tolerating (and skipping over) any other chunk type via
+// word-aligned chunk-size seeks. Returns false if EOF is hit before both
+// required chunks are found, or the file isn't RIFF/WAVE at all.
+static bool wav_parse_header(FILE *f, wav_fmt_info_t *out) {
+    char riff_tag[4], wave_tag[4];
+    uint32_t riff_size;
+    if (fread(riff_tag, 1, 4, f) != 4 || fread(&riff_size, 4, 1, f) != 1 || fread(wave_tag, 1, 4, f) != 4) {
+        return false;
+    }
+    if (memcmp(riff_tag, "RIFF", 4) != 0 || memcmp(wave_tag, "WAVE", 4) != 0) {
+        return false;
+    }
+
+    bool have_fmt = false, have_data = false;
+    memset(out, 0, sizeof(*out));
+
+    while (!(have_fmt && have_data)) {
+        char chunk_tag[4];
+        uint32_t chunk_size;
+        if (fread(chunk_tag, 1, 4, f) != 4 || fread(&chunk_size, 4, 1, f) != 1) {
+            break; // EOF before both chunks were found
+        }
+        if (memcmp(chunk_tag, "fmt ", 4) == 0 && chunk_size >= 16) {
+            long fmt_start = ftell(f);
+            if (fread(&out->audio_format, 2, 1, f) != 1 || fread(&out->num_channels, 2, 1, f) != 1 ||
+                fread(&out->sample_rate, 4, 1, f) != 1) {
+                break;
+            }
+            fseek(f, fmt_start + 14, SEEK_SET); // skip byte_rate/block_align to bits_per_sample
+            if (fread(&out->bits_per_sample, 2, 1, f) != 1) {
+                break;
+            }
+            fseek(f, fmt_start + chunk_size + (chunk_size & 1), SEEK_SET); // skip any WAVE_FORMAT_EXTENSIBLE tail
+            have_fmt = true;
+        } else if (memcmp(chunk_tag, "data", 4) == 0) {
+            out->data_offset = ftell(f);
+            out->data_length = chunk_size;
+            have_data = true;
+            // Deliberately not seeking past the data chunk -- it's the
+            // last thing this reader needs.
+        } else {
+            if (fseek(f, chunk_size + (chunk_size & 1), SEEK_CUR) != 0) {
+                break;
+            }
+        }
+    }
+    return have_fmt && have_data;
+}
+
+static bool wav_file_matches_codec_format(const wav_fmt_info_t &fmt) {
+    return fmt.audio_format == 1 /* PCM */ && fmt.bits_per_sample == 16 && fmt.sample_rate == CHIME_SAMPLE_RATE_HZ &&
+           (fmt.num_channels == 1 || fmt.num_channels == 2);
+}
+
+// Shared tail for both the WAV and generated-tone playback paths.
+static void codec_write_pcm_chunked(const uint8_t *data, size_t total_bytes) {
+    size_t offset = 0;
+    while (offset < total_bytes) {
+        size_t remaining = total_bytes - offset;
+        size_t chunk = remaining < CHIME_IO_CHUNK_FRAMES * CHIME_CHANNELS * CHIME_BYTES_PER_SAMPLE
+                           ? remaining
+                           : CHIME_IO_CHUNK_FRAMES * CHIME_CHANNELS * CHIME_BYTES_PER_SAMPLE;
+        Codec_PlaybackData(const_cast<uint8_t *>(data + offset), chunk);
+        offset += chunk;
+    }
+}
+
+// Streams the `data` chunk of `path` to the codec, upmixing mono to
+// interleaved stereo per chunk (the codec is opened fixed-stereo). False
+// (falls back to the generated tone, with a logged warning) if the file
+// can't be opened, isn't a well-formed WAV, or doesn't exactly match the
+// codec's opened format -- no resampling is attempted.
+static bool play_wav_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "chime: could not open %s", path);
+        return false;
+    }
+    wav_fmt_info_t fmt;
+    if (!wav_parse_header(f, &fmt) || !wav_file_matches_codec_format(fmt)) {
+        ESP_LOGW(TAG, "chime: %s is not a usable WAV (need PCM/16-bit/%dHz mono-or-stereo)", path, CHIME_SAMPLE_RATE_HZ);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "unusable WAV: %s", path);
+        record_device_error("chime_wav_invalid", msg);
+        fclose(f);
+        return false;
+    }
+    fseek(f, fmt.data_offset, SEEK_SET);
+
+    const size_t read_frames = CHIME_IO_CHUNK_FRAMES;
+    const size_t src_bytes_per_frame = fmt.num_channels * CHIME_BYTES_PER_SAMPLE;
+    uint8_t *read_buf = static_cast<uint8_t *>(heap_caps_malloc(read_frames * src_bytes_per_frame, MALLOC_CAP_SPIRAM));
+    uint8_t *stereo_buf = static_cast<uint8_t *>(
+        heap_caps_malloc(read_frames * CHIME_CHANNELS * CHIME_BYTES_PER_SAMPLE, MALLOC_CAP_SPIRAM));
+    if (!read_buf || !stereo_buf) {
+        ESP_LOGE(TAG, "chime: failed to allocate WAV read buffers");
+        record_device_error("heap_alloc_failed", "play_wav_file read/stereo buffers");
+        if (read_buf) heap_caps_free(read_buf);
+        if (stereo_buf) heap_caps_free(stereo_buf);
+        fclose(f);
+        return false;
+    }
+
+    uint32_t bytes_remaining = fmt.data_length;
+    while (bytes_remaining > 0) {
+        size_t want_bytes = read_frames * src_bytes_per_frame;
+        if (want_bytes > bytes_remaining) {
+            want_bytes = bytes_remaining;
+        }
+        size_t got = fread(read_buf, 1, want_bytes, f);
+        if (got == 0) {
+            break;
+        }
+        size_t frames = got / src_bytes_per_frame;
+
+        if (fmt.num_channels == 2) {
+            codec_write_pcm_chunked(read_buf, frames * CHIME_CHANNELS * CHIME_BYTES_PER_SAMPLE);
+        } else {
+            const int16_t *mono = reinterpret_cast<const int16_t *>(read_buf);
+            int16_t *stereo = reinterpret_cast<int16_t *>(stereo_buf);
+            for (size_t i = 0; i < frames; i++) {
+                stereo[i * 2] = mono[i];
+                stereo[i * 2 + 1] = mono[i];
+            }
+            codec_write_pcm_chunked(stereo_buf, frames * CHIME_CHANNELS * CHIME_BYTES_PER_SAMPLE);
+        }
+        bytes_remaining -= (uint32_t)got;
+    }
+
+    heap_caps_free(read_buf);
+    heap_caps_free(stereo_buf);
+    fclose(f);
+    return true;
+}
+
+// No SD card / no usable file fallback: a short synthesized sine beep
+// with a slow amplitude ramp-up (the requested "slow ramp-up") and a
+// brief fade-out tail to avoid a click at the end of the buffer.
+static void play_generated_tone_chime(void) {
+    size_t total_frames = (size_t)CHIME_SAMPLE_RATE_HZ * CHIME_TONE_DURATION_MS / 1000;
+    size_t fade_in_frames = (size_t)((double)total_frames * CHIME_TONE_FADE_IN_FRACTION);
+    size_t fade_out_frames = (size_t)CHIME_SAMPLE_RATE_HZ * CHIME_TONE_FADE_OUT_MS / 1000;
+
+    int16_t *buf = static_cast<int16_t *>(
+        heap_caps_malloc(total_frames * CHIME_CHANNELS * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    if (!buf) {
+        ESP_LOGE(TAG, "chime: failed to allocate tone buffer");
+        return;
+    }
+
+    for (size_t i = 0; i < total_frames; i++) {
+        double envelope = 1.0;
+        if (i < fade_in_frames) {
+            envelope = (double)i / (double)fade_in_frames;
+        } else if (i >= total_frames - fade_out_frames) {
+            envelope = (double)(total_frames - i) / (double)fade_out_frames;
+        }
+        double t = (double)i / CHIME_SAMPLE_RATE_HZ;
+        double sample = envelope * CHIME_TONE_AMPLITUDE * sin(2.0 * M_PI * CHIME_TONE_FREQ_HZ * t);
+        int16_t s16 = (int16_t)(sample * 32767.0);
+        buf[i * 2] = s16;
+        buf[i * 2 + 1] = s16;
+    }
+
+    codec_write_pcm_chunked(reinterpret_cast<uint8_t *>(buf), total_frames * CHIME_CHANNELS * sizeof(int16_t));
+    heap_caps_free(buf);
+}
+
+// Single entry point: try an SD-card WAV first, fall back to the
+// generated tone. Handles its own audio power-on/off, matching the
+// pattern used by run_push_to_talk_cycle() elsewhere in this file.
+static void play_reminder_chime(void) {
+    BoardPower_Audio_ON();
+    Codec_StartInit();
+    Codec_SetPlaybackVolume(CHIME_VOLUME_PERCENT);
+
+    bool played = false;
+    char wav_path[160];
+    if (ensure_sdcard_mounted() && find_random_wav_in_notesnd(wav_path, sizeof(wav_path))) {
+        played = play_wav_file(wav_path);
+    }
+    if (!played) {
+        play_generated_tone_chime();
+    }
+
+    BoardPower_Audio_OFF();
+}
+
+// Chimes for `soonest` if it's actually due and hasn't already been
+// announced (dedup via s_last_announced_reminder_id). Returns true if it
+// fired this cycle (chimed + marked announced) -- callers use that to
+// decide whether to override a live check-in on screen with this
+// reminder. Takes precedence over any live check-in unconditionally: a
+// reminder becoming due always wins, it no longer defers to a check-in
+// that's currently showing. Only ever called on a genuine RTC-timer
+// wake (both call sites gate on wake_reason == "timer"), which is what
+// keeps this safe to also use for the display-override decision --
+// s_last_announced_reminder_id would otherwise risk being set by a
+// PWR-tap sync, silently suppressing the real timer-wake chime later.
+static bool handle_due_reminder(const sync_soonest_reminder_t &soonest) {
+    if (!soonest.have_reminder) {
+        return false;
+    }
+    int64_t now_epoch = time(nullptr);
+    if (soonest.due_at > now_epoch) {
+        return false; // not due yet -- alarm scheduling wakes early for it
+    }
+    if (strncmp(soonest.id, s_last_announced_reminder_id, sizeof(s_last_announced_reminder_id)) == 0) {
+        return false; // already chimed for this exact reminder id
+    }
+
+    ESP_LOGI(TAG, "reminder due: playing chime for id=%s", soonest.id);
+    play_reminder_chime();
+    strncpy(s_last_announced_reminder_id, soonest.id, sizeof(s_last_announced_reminder_id) - 1);
+    s_last_announced_reminder_id[sizeof(s_last_announced_reminder_id) - 1] = '\0';
+    return true;
+}
+
+// Soonest-due entry (past or future) in the compact RTC-persisted cache --
+// same shape as sync_soonest_reminder_t so it can feed straight into
+// handle_due_reminder() and, when overriding a live check-in on screen,
+// straight into a next_item_t for drawing too.
+static sync_soonest_reminder_t find_soonest_cached_reminder(void) {
+    sync_soonest_reminder_t result = {};
+    for (int i = 0; i < s_pending_reminders_count; i++) {
+        if (!result.have_reminder || s_pending_reminders[i].due_at < result.due_at) {
+            result.have_reminder = true;
+            result.due_at = s_pending_reminders[i].due_at;
+            strncpy(result.id, s_pending_reminders[i].id, sizeof(result.id) - 1);
+            result.id[sizeof(result.id) - 1] = '\0';
+            strncpy(result.message, s_pending_reminders[i].message, sizeof(result.message) - 1);
+            result.message[sizeof(result.message) - 1] = '\0';
+        }
+    }
+    return result;
+}
+
+// Shared tail for both the full-sync cycle and reminder-only wakes:
+// decides the next alarm from cached reminder data + the known sync
+// deadline, persists whether the next "timer" wake should be the
+// lightweight reminder-only path, and sleeps. Never returns.
+static void schedule_next_wake_and_sleep(pcf85063a_dev_t *rtc_dev) {
+    int64_t now_epoch = time(nullptr);
+    sync_soonest_reminder_t soonest = find_soonest_cached_reminder();
+    bool have_future_reminder = soonest.have_reminder && soonest.due_at > now_epoch;
+    int64_t seconds_until_reminder = have_future_reminder ? (soonest.due_at - now_epoch) : 0;
+
+    int64_t seconds_until_sync = (s_next_full_sync_at > 0)
+        ? (s_next_full_sync_at - now_epoch)
+        : sync_effective_poll_interval(s_has_synced_ever, s_last_known_good_poll_interval, FALLBACK_POLL_INTERVAL_SECONDS);
+
+    bool is_reminder_wake = false;
+    int interval = sync_effective_alarm_interval_seconds(
+        (int)seconds_until_sync, have_future_reminder, seconds_until_reminder,
+        SYNC_MIN_ALARM_INTERVAL_SECONDS, &is_reminder_wake);
+
+    s_next_wake_is_reminder_only = is_reminder_wake;
+    ESP_LOGI(TAG, "next wake in %ds (%s)", interval, is_reminder_wake ? "reminder-only" : "full sync");
+    rtc_schedule_alarm(rtc_dev, interval);
+    enter_deep_sleep(); // never returns
+}
+
+// F9: the lightweight path for a "timer" wake that was scheduled
+// specifically for an upcoming reminder (s_next_wake_is_reminder_only).
+// No wifi, no /device/sync -- just chime (if still due and not already
+// announced) and reschedule from whatever was cached at the last full
+// sync. The one exception: if the reminder just activated *and* a live
+// check-in was showing, this redraws the screen to show the reminder
+// instead (using cached weather + a fresh local battery read -- no
+// network involved either way), overriding the check-in. That's the
+// only case that touches ADC/e-ink here; the common case (no check-in
+// showing) stays exactly as cheap as before. Never returns.
+static void handle_reminder_only_wake(pcf85063a_dev_t *rtc_dev) {
+    sync_soonest_reminder_t soonest = find_soonest_cached_reminder();
+    bool activated = handle_due_reminder(soonest);
+
+    if (activated && s_last_screen.valid && s_last_screen.is_checkin) {
+        BoardAdc_Init();
+        uint8_t battery_pct = Get_Batterylevel();
+
+        next_item_t reminder_item = {};
+        reminder_item.have_next = true;
+        reminder_item.is_event = false;
+        reminder_item.at = soonest.due_at;
+        strncpy(reminder_item.label, soonest.message, sizeof(reminder_item.label) - 1);
+        reminder_item.label[sizeof(reminder_item.label) - 1] = '\0';
+
+        eink_ensure_initialized();
+        EPD_Clear();
+        draw_status_bar(s_last_screen.has_weather, s_last_screen.weather, battery_pct, nullptr);
+        draw_dashboard(reminder_item);
+        EPD_Display();
+        ESP_LOGI(TAG, "e-ink render done (reminder-override, reminder-only wake)");
+
+        s_last_screen.is_checkin = false;
+        s_last_screen.next = reminder_item;
+    }
+
+    schedule_next_wake_and_sleep(rtc_dev); // never returns
 }
 
 // Records into buf (capacity max_bytes, stereo/16-bit PCM) in ~200ms
@@ -1652,11 +2246,25 @@ extern "C" void app_main(void) {
     sync_tz_apply(s_tz_posix, "UTC0");
 
     // I2C bus is shared by the RTC and the SHTC3 sensor (the audio codec
-    // manages its own separate I2C init internally).
+    // manages its own separate I2C init internally). Brought up here,
+    // ahead of the F9 reminder-only branch below, since that branch still
+    // needs the RTC (to read "now" and reschedule the alarm) even though
+    // it skips everything else in this section.
     I2cMasterBus *i2c_bus = I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     pcf85063a_dev_t rtc_dev;
     ESP_ERROR_CHECK(pcf85063a_init(&rtc_dev, i2c_bus->Get_I2cBusHandle(), PCF85063A_ADDRESS));
-    Shtc3_Init(i2c_bus);
+
+    // F9: a "timer" wake scheduled specifically for an upcoming reminder
+    // skips wifi/sync entirely -- just chime and reschedule. Distinguished
+    // from a normal poll-interval "timer" wake via
+    // s_next_wake_is_reminder_only, since the PCF85063 has only one
+    // hardware alarm register and can't tell firmware *why* it fired.
+    // Never returns if taken.
+    if (strcmp(wake_reason, "timer") == 0 && s_next_wake_is_reminder_only) {
+        handle_reminder_only_wake(&rtc_dev);
+    }
+
+    Shtc3_Init(i2c_bus); // only the full cycle below needs temp/humidity
 
     // Read before wifi/sync, not after -- F1 (PROJECT_PLAN.md) wants
     // battery_mv in the sync request body itself, not just logged
@@ -1680,7 +2288,14 @@ extern "C" void app_main(void) {
     bool have_fresh_snapshot = false;
 
     if (wifi_ok) {
-        const size_t resp_capacity = 8192;
+        // 32KiB, up from a prior 8192 -- that was tight even before this
+        // feature (8 checkins/reminders/calendar_events at up to 256
+        // bytes of text each can already approach ~9-10KB combined), and
+        // silently truncated rather than erroring (see the `truncated`
+        // flag on http_response_buf_t below). Buffer is PSRAM-backed and
+        // freed right after this cycle's sync attempt, so the extra size
+        // costs nothing real.
+        const size_t resp_capacity = 32768;
         http_response_buf_t resp;
         resp.data = static_cast<char *>(heap_caps_malloc(resp_capacity, MALLOC_CAP_SPIRAM));
         resp.capacity = resp_capacity;
@@ -1718,6 +2333,16 @@ extern "C" void app_main(void) {
             }
         } else {
             ESP_LOGE(TAG, "/device/sync failed after retries (last status %d)", http_status);
+            // Only recorded here, not also inside device_sync_attempt's
+            // truncation branch -- that path already records its own
+            // more specific "sync_response_truncated" error, and the
+            // single-slot pending state would just overwrite it with
+            // this more generic one if both ran.
+            if (!resp.truncated) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "status %d after retries", http_status);
+                record_device_error("sync_failed", msg);
+            }
         }
 
         heap_caps_free(resp.data);
@@ -1729,6 +2354,14 @@ extern "C" void app_main(void) {
     // *last successful* sync's poll_interval_seconds used as the sleep
     // duration when this cycle fails, not the hardcoded fallback, as
     // long as one has ever succeeded.
+
+    // Flush now that wifi's state for this cycle is known -- catches
+    // whatever's pending from this cycle's own sync_failed/truncated
+    // above, or from an earlier network-free reminder-only wake (F9).
+    // No-op (and no wifi assumption needed) if nothing is pending.
+    if (wifi_ok) {
+        flush_pending_device_error(reset_reason, wake_reason, battery_mv, battery_pct);
+    }
 
     // F5: this cycle's actual wake-to-sync-response duration, measured
     // now that the sync attempt (success, retries-exhausted, or wifi
@@ -1750,11 +2383,42 @@ extern "C" void app_main(void) {
     // via F8 hardware testing that silently leaving the old screen up
     // with zero indication gives no visible signal of a real wifi/backend
     // problem.
+    sync_soonest_reminder_t soonest_reminder = {};
+    bool reminder_activated = false;
     if (have_fresh_snapshot) {
-        eink_render(*snap, battery_pct);
+        // F9: computed (and, on a timer wake, acted on) *before* rendering
+        // -- eink_render() needs to know whether a reminder just activated
+        // so it can override a live check-in on screen with it, and
+        // chiming/dedup-marking has to happen exactly once, not split
+        // across a pre-render and post-render pass.
+        soonest_reminder = sync_find_soonest_reminder(snap);
+        if (strcmp(wake_reason, "timer") == 0) {
+            reminder_activated = handle_due_reminder(soonest_reminder);
+        }
+
+        eink_render(*snap, battery_pct, reminder_activated ? &soonest_reminder : nullptr);
+
+        // F9: re-cache reminders (id+message+due_at) for reminder-only
+        // wakes between now and the next full sync.
+        if (snap->reminders_valid) {
+            s_pending_reminders_count = snap->reminders_count < SYNC_MAX_REMINDERS ? snap->reminders_count : SYNC_MAX_REMINDERS;
+            for (int i = 0; i < s_pending_reminders_count; i++) {
+                strncpy(s_pending_reminders[i].id, snap->reminders[i].id, sizeof(s_pending_reminders[i].id) - 1);
+                s_pending_reminders[i].id[sizeof(s_pending_reminders[i].id) - 1] = '\0';
+                strncpy(s_pending_reminders[i].message, snap->reminders[i].message, sizeof(s_pending_reminders[i].message) - 1);
+                s_pending_reminders[i].message[sizeof(s_pending_reminders[i].message) - 1] = '\0';
+                s_pending_reminders[i].due_at = snap->reminders[i].due_at;
+            }
+        } else {
+            s_pending_reminders_count = 0;
+        }
     } else {
         ESP_LOGW(TAG, "sync failed this cycle -- showing last-known screen with a SYNC FAILED notice");
         eink_render_last_known(battery_pct, "SYNC FAILED");
+        // s_pending_reminders/s_next_full_sync_at deliberately left
+        // untouched on failure -- keep using the last known-good reminder
+        // timing rather than discarding it, matching this file's existing
+        // last-known-good pattern for s_last_known_good_poll_interval.
     }
     if (snap) {
         heap_caps_free(snap);
@@ -1764,6 +2428,9 @@ extern "C" void app_main(void) {
 
     int effective_poll_interval = sync_effective_poll_interval(
         s_has_synced_ever, s_last_known_good_poll_interval, FALLBACK_POLL_INTERVAL_SECONDS);
-    rtc_schedule_alarm(&rtc_dev, effective_poll_interval);
-    enter_deep_sleep();
+    if (have_fresh_snapshot) {
+        s_next_full_sync_at = time(nullptr) + effective_poll_interval;
+    }
+
+    schedule_next_wake_and_sleep(&rtc_dev); // never returns
 }
