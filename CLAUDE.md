@@ -4,28 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project plan
 
-`PROJECT_PLAN.md` is the working roadmap from empty repo to full feature set — environment
-setup, a bring-up flash test, then an ordered feature list with test criteria and possible
-backend-side changes noted per feature. It's a checklist meant to be worked through
-incrementally across sessions — check current progress there before starting work, and
-check items off as they're completed.
+`PROJECT_PLAN.md` is a historical record of this project's initial buildout — environment
+setup, a bring-up flash test, then the F1-F9 feature list with test criteria and backend-side
+notes per feature. That roadmap is complete; it's kept for reference (hardware bring-up
+decisions, rationale behind existing features) but isn't a live backlog. New work from here is
+ad-hoc — no need to check it before starting work or add entries to it.
 
 ## Repository state
 
-This repo currently contains **no firmware source code** — only two spec documents. The
-ESP-IDF project (`main/`, `CMakeLists.txt`, `sdkconfig.defaults`, components, etc.) has not
-been created yet. Read both docs in full before writing any code:
+The ESP-IDF project is built out and the F1-F9 feature roadmap in `PROJECT_PLAN.md` is
+complete (see `README.md` for build/flash/test commands). Two reference docs remain
+authoritative for anything not obvious from the code itself:
 
-1. **`ESP32-S3-ePaper-hardware-reference.md`** — read this first. Authoritative reference for
-   board identity, pin assignments, peripheral drivers, and ESP-IDF configuration, extracted
-   directly from Waveshare's official example repo (`waveshare/ESP32-S3-ePaper-1.54`,
-   `02_Example/ESP-IDF/V2/`).
-2. **`ESP32_FIRMWARE_SPEC.md`** — the network/behavioral contract this firmware must implement
-   against its backend (a separate FastAPI + LangGraph project, not in this repo). Builds on
-   top of the hardware doc rather than repeating it.
+1. **`ESP32-S3-ePaper-hardware-reference.md`** — board identity, pin assignments, peripheral
+   drivers, and ESP-IDF configuration, extracted directly from Waveshare's official example
+   repo (`waveshare/ESP32-S3-ePaper-1.54`, `02_Example/ESP-IDF/V2/`). Consult before touching
+   pin assignments or peripheral init code.
+2. **`ESP32_FIRMWARE_SPEC.md`** — the network/behavioral contract this firmware implements
+   against its backend (a separate FastAPI + LangGraph project, not in this repo).
 
-Once the ESP-IDF project exists, this file should be updated with the actual build/flash/test
-commands used in that project.
+Almost all firmware logic lives in `main/adhi-firmware.cpp`, with board support split out into
+`components/port_bsp` (display, codec, i2c, sdcard, power, adc, shtc3), `components/sync_proto`
+(snapshot parsing, backoff, TZ apply — has host-native unit tests), `components/codec_board`
+(ES8311 abstraction), and `components/my_button`.
 
 ## What this device is
 
@@ -36,12 +37,18 @@ A dual-purpose device, one physical board (Waveshare ESP32-S3-ePaper-1.54 V2, no
 2. **Periodic deep-sleep sync + eink display** — wakes on an RTC alarm, pulls a 24h snapshot
    (check-ins, reminders, calendar events, weather) from the backend, renders it to the eink
    display, goes back to sleep.
+3. **Exact-time reminder wake + chime** (F9) — the device also wakes itself for a reminder's
+   exact `due_at`, independent of the regular poll interval, and plays a short chime through
+   the speaker. This wake never performs a network sync — it works entirely from a compact
+   reminder cache refreshed at the last full sync, so it costs no wifi/backend round-trip.
 
-**Priority framing**: this device is a display/input surface, not the delivery mechanism.
-The backend's own scheduler and push notifications (to the user's phone) are what actually
-fire reminders — regardless of whether this device is online. A sync failure or stale
-display is a degraded UX, never a missed reminder. Firmware must never let a retry loop,
-crash, or sync failure burn battery or brick the device.
+**Priority framing**: for check-ins and calendar events, this device is a display/input
+surface, not the delivery mechanism — the backend's own scheduler and push notifications (to
+the user's phone) are what actually fire those, regardless of whether this device is online.
+Reminders are the one exception: this device wakes and chimes for them directly (F9), in
+addition to whatever the backend/phone side does. For everything else, a sync failure or
+stale display is a degraded UX, never a missed reminder. Firmware must never let a retry
+loop, crash, or sync failure burn battery or brick the device.
 
 ## Backend network contract (see ESP32_FIRMWARE_SPEC.md for full detail)
 
@@ -68,10 +75,23 @@ crash, or sync failure burn battery or brick the device.
   retry indefinitely or busy-loop. Malformed/partial JSON should degrade only the affected
   display section, not abort the cycle.
 
+## Firmware versioning
+
+`firmware_version` (sent on every `/device/sync` request, and on `/device/error` reports) must
+be bumped at least once before every commit that changes `main/` or any `components/` source —
+currently a hardcoded literal string in `device_sync()`'s request-body construction
+(`main/adhi-firmware.cpp`). In practice it has drifted badly: it was last bumped
+(`0.1.0-bringup` → `0.2.0-f1`) at the Phase 1→Phase 2 transition and never touched since,
+despite many feature commits landing after it — which makes it useless for correlating
+backend-reported telemetry/errors with what code was actually running on the device at the
+time. The bumped value must be included in the same commit as the change it describes, not a
+separate follow-up commit.
+
 ## Hardware summary (see ESP32-S3-ePaper-hardware-reference.md for full detail)
 
-- Target `esp32s3`, ESP-IDF 5.5.1, 4MB flash QIO, **Octal** SPI PSRAM (V2-specific — not
-  Quad), single-factory partition table with **no OTA slot**.
+- Target `esp32s3`, ESP-IDF 5.5.1, 8MB flash QIO (this physical unit is an ESP32-S3-PICO-1
+  SiP with 8MB embedded flash — the hardware doc's 4MB figure doesn't apply here), **Octal**
+  SPI PSRAM (V2-specific — not Quad), single-factory partition table with **no OTA slot**.
 - E-paper: SSD1681/SSD1680-family, custom bespoke driver (not GxEPD2) — copy from
   `02_Example/ESP-IDF/V2/11_FactoryProgram/components/port_bsp/port_display.{h,cpp}`. Use
   `EPD_DisplayPart()` for routine partial refreshes, `EPD_Display()` full refresh ~daily to
