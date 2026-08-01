@@ -32,6 +32,7 @@
 #include <esp_event.h>
 #include <esp_wifi.h>
 #include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 
@@ -82,7 +83,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.3.0-device-error"
+#define FIRMWARE_VERSION "0.3.1-crt-bundle"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -409,6 +410,7 @@ static bool send_device_error(const char *error_type, const char *message, const
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.timeout_ms = 10000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "auth", API_TOKEN);
@@ -496,6 +498,7 @@ static bool device_sync_attempt(const char *request_body, http_response_buf_t *r
     config.event_handler = http_event_handler;
     config.user_data = resp;
     config.timeout_ms = 10000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "auth", API_TOKEN);
@@ -1891,6 +1894,7 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     // the worst case (the full 60s/1.92MB-mono recording cap) with
     // headroom; may still need tuning once tested against that case.
     config.timeout_ms = 60000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "auth", API_TOKEN);
@@ -1970,6 +1974,7 @@ static bool skip_checkin(const char *checkin_id) {
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.timeout_ms = 10000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "auth", API_TOKEN);

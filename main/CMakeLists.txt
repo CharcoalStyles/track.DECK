@@ -12,4 +12,5 @@ idf_component_register(SRCS "adhi-firmware.cpp"
                     esp_event
                     esp_http_client
                     esp_timer
-                    driver)
+                    driver
+                    mbedtls)
