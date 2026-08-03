@@ -83,7 +83,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.4.0-voice-retry-queue"
+#define FIRMWARE_VERSION "0.4.1-poweroff-screen"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -2343,7 +2343,24 @@ static void run_checkin_skip_cycle(void) {
 // the RTC alarm or another button press should be able to interrupt.
 static void run_power_off_cycle(void) {
     ESP_LOGI(TAG, "PWR held -- shutting down");
-    eink_show_message("SHUTTING DOWN");
+
+    // Two centered lines instead of a plain "SHUTTING DOWN" message --
+    // e-ink is bistable, so this stays visible on screen after VBAT is
+    // cut below, same as the normal message would.
+    eink_ensure_initialized();
+    EPD_Clear();
+    const int scale = 3;
+    const char *line1 = "TRACK";
+    const char *line2 = "DECK";
+    int w1 = (int)strlen(line1) * (FONT_GLYPH_W + 1) * scale;
+    int w2 = (int)strlen(line2) * (FONT_GLYPH_W + 1) * scale;
+    int line_h = (FONT_GLYPH_H + 4) * scale;
+    int y0 = (EPD_HEIGHT - line_h * 2) / 2;
+    draw_text(line1, (EPD_WIDTH - w1) / 2, y0, scale, DRIVER_COLOR_BLACK);
+    draw_text(line2, (EPD_WIDTH - w2) / 2, y0 + line_h, scale, DRIVER_COLOR_BLACK);
+    EPD_Display();
+    ESP_LOGI(TAG, "e-ink message shown: track/deck");
+
     vTaskDelay(pdMS_TO_TICKS(300));
 
     BoardPower_EPD_OFF();
