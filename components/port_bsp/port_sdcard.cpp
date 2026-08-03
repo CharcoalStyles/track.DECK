@@ -9,8 +9,6 @@
 #include "port_sdcard.h"
 #include "epaper_config.h"
 
-static const char *TAG = "sdcard";
-
 sdmmc_card_t *card = NULL;  
 uint32_t sdcard_slot = 0;
 
@@ -47,56 +45,3 @@ float sd_card_get_value(void) {
   	return -1;
 }
 
-esp_err_t Sdcard_WriteFile(const char *path, char *data)
-{
-  	esp_err_t err;
-  	if(card == NULL)
-  	{
-  	  	return ESP_ERR_NOT_FOUND;
-  	}
-  	err = sdmmc_get_status(card); //First check if there is an SD card
-  	if(err != ESP_OK)
-  	{
-  	  	return err;
-  	}
-  	FILE *f = fopen(path, "w"); //Get path address
-  	if(f == NULL)
-  	{
-  	  	ESP_LOGI(TAG,"path:Write Wrong path");
-  	  	return ESP_ERR_NOT_FOUND;
-  	}
-  	fprintf(f, data); //write in
-  	fclose(f);
-  	return ESP_OK;
-}
-
-esp_err_t Sdcard_ReadFile(const char *path,char *pxbuf,uint32_t *outLen)
-{
-  	esp_err_t err;
-  	if(card == NULL)
-  	{
-  	  	ESP_LOGI(TAG,"card == NULL");
-  	  	return ESP_ERR_NOT_FOUND;
-  	}
-  	err = sdmmc_get_status(card); //First check if there is an SD card
-  	if(err != ESP_OK)
-  	{
-  	  	ESP_LOGI(TAG,"card == NO");
-  	  	return err;
-  	}
-  	FILE *f = fopen(path, "rb");
-  	if (f == NULL)
-  	{
-  	  	ESP_LOGI(TAG,"Read Wrong path");
-  	  	return ESP_ERR_NOT_FOUND;
-  	}
-  	fseek(f, 0, SEEK_END);     //Move the pointer to the back
-  	uint32_t unlen = ftell(f);
-  	//fgets(pxbuf, unlen, f);  //Read text
-  	fseek(f, 0, SEEK_SET);     //Move the pointer to the front
-  	uint32_t poutLen = fread((void *)pxbuf,1,unlen,f);
-  	if(outLen != NULL)
-  	*outLen = poutLen;
-  	fclose(f);
-  	return ESP_OK;
-}

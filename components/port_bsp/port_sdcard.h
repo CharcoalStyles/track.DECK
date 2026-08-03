@@ -13,8 +13,6 @@ extern "C" {
 
 
 bool Sdcard_Init(void);
-esp_err_t Sdcard_ReadFile(const char *path,char *pxbuf,uint32_t *outLen);
-esp_err_t Sdcard_WriteFile(const char *path, char *data);
 
 
 

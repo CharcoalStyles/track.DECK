@@ -83,7 +83,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.4.1-poweroff-screen"
+#define FIRMWARE_VERSION "0.4.2-simplify-f6-f9"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -373,6 +373,51 @@ static RTC_DATA_ATTR bool s_pending_error = false;
 static RTC_DATA_ATTR char s_pending_error_type[DEVICE_ERROR_TYPE_LEN] = "";
 static RTC_DATA_ATTR char s_pending_error_message[DEVICE_ERROR_MESSAGE_LEN] = "";
 
+// Shared shape for the three simple POST call sites (device_sync's
+// per-attempt request, /device/error, checkin skip): build a JSON-or-empty
+// POST, run it, report whether the status was 2xx. Deliberately not used
+// by the /voice upload -- that's a structurally different streaming
+// multipart upload (esp_http_client_open/write/fetch_headers), not a
+// single set_post_field() call, so folding it in here would just be a
+// forced-fit abstraction. `event_handler`/`user_data` are optional (used
+// only by device_sync_attempt, to stream the response into its own
+// buffer); `body` is optional (skip_checkin has none).
+static bool http_post(const char *url, const char *body,
+                       http_event_handle_cb event_handler, void *user_data,
+                       int *out_status) {
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 10000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    if (event_handler) {
+        config.event_handler = event_handler;
+        config.user_data = user_data;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "auth", API_TOKEN);
+    if (body) {
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+    int status = -1;
+    if (err == ESP_OK) {
+        status = esp_http_client_get_status_code(client);
+        ok = (status >= 200 && status < 300);
+    } else {
+        ESP_LOGE(TAG, "POST %s failed: %s", url, esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+    if (out_status) {
+        *out_status = status;
+    }
+    return ok;
+}
+
 static void record_device_error(const char *error_type, const char *message) {
     s_pending_error = true;
     strncpy(s_pending_error_type, error_type, sizeof(s_pending_error_type) - 1);
@@ -406,29 +451,12 @@ static bool send_device_error(const char *error_type, const char *message, const
     char url[256];
     snprintf(url, sizeof(url), "%s/device/error", BACKEND_BASE_URL);
 
-    esp_http_client_config_t config = {};
-    config.url = url;
-    config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 10000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "auth", API_TOKEN);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, body, strlen(body));
-
-    esp_err_t err = esp_http_client_perform(client);
-    bool ok = false;
-    if (err == ESP_OK) {
-        int status = esp_http_client_get_status_code(client);
-        ok = (status >= 200 && status < 300);
-        if (!ok) {
-            ESP_LOGW(TAG, "/device/error POST returned status %d", status);
-        }
-    } else {
-        ESP_LOGW(TAG, "/device/error POST failed: %s", esp_err_to_name(err));
+    int status = -1;
+    bool ok = http_post(url, body, nullptr, nullptr, &status);
+    if (!ok && status >= 0) {
+        ESP_LOGW(TAG, "/device/error POST returned status %d", status);
     }
-    esp_http_client_cleanup(client);
+
     cJSON_free(body);
     cJSON_Delete(root);
     return ok;
@@ -492,35 +520,13 @@ static bool device_sync_attempt(const char *request_body, http_response_buf_t *r
     char url[256];
     snprintf(url, sizeof(url), "%s/device/sync", BACKEND_BASE_URL);
 
-    esp_http_client_config_t config = {};
-    config.url = url;
-    config.method = HTTP_METHOD_POST;
-    config.event_handler = http_event_handler;
-    config.user_data = resp;
-    config.timeout_ms = 10000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "auth", API_TOKEN);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, request_body, strlen(request_body));
-
-    esp_err_t err = esp_http_client_perform(client);
-    bool ok = false;
-    if (err == ESP_OK) {
-        *out_status = esp_http_client_get_status_code(client);
-        ok = (*out_status >= 200 && *out_status < 300);
-        if (ok && resp->truncated) {
-            ESP_LOGE(TAG, "/device/sync response truncated at %u bytes (capacity %u) -- treating as failed attempt",
-                     (unsigned)resp->written, (unsigned)resp->capacity);
-            record_device_error("sync_response_truncated", "response exceeded resp_capacity");
-            ok = false;
-        }
-    } else {
-        ESP_LOGE(TAG, "http_client_perform failed: %s", esp_err_to_name(err));
-        *out_status = -1;
+    bool ok = http_post(url, request_body, http_event_handler, resp, out_status);
+    if (ok && resp->truncated) {
+        ESP_LOGE(TAG, "/device/sync response truncated at %u bytes (capacity %u) -- treating as failed attempt",
+                 (unsigned)resp->written, (unsigned)resp->capacity);
+        record_device_error("sync_response_truncated", "response exceeded resp_capacity");
+        ok = false;
     }
-    esp_http_client_cleanup(client);
     return ok;
 }
 
@@ -1019,9 +1025,25 @@ static RTC_DATA_ATTR char s_last_announced_reminder_id[SYNC_STR_ID_LEN] = "";
 // Bottom-right "N/15" queued-voice-note indicator -- forward-declared here
 // since eink_render()/eink_render_last_known() below need to call it, but
 // its body (defined down in the voice-note SD retry queue section) needs
-// ensure_sdcard_mounted()/pending_voice_scan()/PENDING_VOICE_MAX_QUEUED,
+// ensure_sdcard_mounted()/pending_voice_list_sorted()/PENDING_VOICE_MAX_QUEUED,
 // none of which are visible yet at this point in the file.
 static void draw_pending_voice_indicator(void);
+
+// Shared by eink_render()'s reminder-override branch and
+// handle_reminder_only_wake() (the two places a reminder that just
+// activated takes over the screen): clear, status bar, dashboard on the
+// reminder, queued-voice indicator, flip. Owns EPD_Clear/EPD_Display
+// itself since both callers always want the whole screen replaced, never
+// a partial redraw.
+static void draw_reminder_override_screen(bool has_weather, const sync_weather_t &weather, int battery_pct,
+                                           const next_item_t &reminder_item) {
+    eink_ensure_initialized();
+    EPD_Clear();
+    draw_status_bar(has_weather, weather, battery_pct, nullptr);
+    draw_dashboard(reminder_item);
+    draw_pending_voice_indicator();
+    EPD_Display();
+}
 
 // F9: override_reminder is non-null only when handle_due_reminder() just
 // fired this cycle -- a reminder that just activated always takes over
@@ -1030,42 +1052,43 @@ static void draw_pending_voice_indicator(void);
 // (which merges reminders+calendar events and could in principle land on
 // a different item) so what's drawn always matches what actually chimed.
 static void eink_render(const sync_snapshot_t &snap, int battery_pct, const sync_soonest_reminder_t *override_reminder) {
-    eink_ensure_initialized();
-    EPD_Clear();
-
-    draw_status_bar(snap.has_weather, snap.weather, battery_pct, nullptr);
-
-    const sync_checkin_t *live_checkin = find_live_checkin(snap);
-    next_item_t next = find_next_item(snap);
-
+    const sync_checkin_t *live_checkin = nullptr;
+    next_item_t next = {};
     next_item_t reminder_item = {};
+    const char *render_kind;
+
     if (override_reminder) {
         reminder_item.have_next = true;
         reminder_item.is_event = false;
         reminder_item.at = override_reminder->due_at;
         strncpy(reminder_item.label, override_reminder->message, sizeof(reminder_item.label) - 1);
         reminder_item.label[sizeof(reminder_item.label) - 1] = '\0';
-    }
 
-    const char *render_kind;
-    if (override_reminder) {
-        draw_dashboard(reminder_item);
-        draw_pending_voice_indicator();
+        draw_reminder_override_screen(snap.has_weather, snap.weather, battery_pct, reminder_item);
         render_kind = "reminder-override";
-    } else if (live_checkin) {
-        draw_checkin(live_checkin->prompt_text);
-        // No indicator here -- a live check-in deliberately takes over the
-        // whole screen (see this function's header comment), and its
-        // wrapped prompt text can already run all the way to the bottom
-        // edge (draw_checkin()'s own comment on its 14-line cap).
-        render_kind = "check-in";
     } else {
-        draw_dashboard(next);
-        draw_pending_voice_indicator();
-        render_kind = "dashboard";
-    }
+        live_checkin = find_live_checkin(snap);
+        next = find_next_item(snap);
 
-    EPD_Display();
+        eink_ensure_initialized();
+        EPD_Clear();
+        draw_status_bar(snap.has_weather, snap.weather, battery_pct, nullptr);
+
+        if (live_checkin) {
+            draw_checkin(live_checkin->prompt_text);
+            // No indicator here -- a live check-in deliberately takes over the
+            // whole screen (see this function's header comment), and its
+            // wrapped prompt text can already run all the way to the bottom
+            // edge (draw_checkin()'s own comment on its 14-line cap).
+            render_kind = "check-in";
+        } else {
+            draw_dashboard(next);
+            draw_pending_voice_indicator();
+            render_kind = "dashboard";
+        }
+
+        EPD_Display();
+    }
     ESP_LOGI(TAG, "e-ink render done (%s)", render_kind);
 
     s_last_screen.valid = true;
@@ -1260,32 +1283,6 @@ static void log_reset_history(const char *reset_reason, const char *wake_reason,
     fclose(f);
 }
 
-static void sdcard_test(void) {
-    if (!ensure_sdcard_mounted()) {
-        ESP_LOGE(TAG, "SD card mount failed");
-        return;
-    }
-    const char *path = SDlist "/bringup_test.txt";
-    const char *content = "adhi-firmware Phase 1 bring-up test\n";
-
-    esp_err_t err = Sdcard_WriteFile(path, (char *)content);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD card write failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    char readback[128] = {0};
-    uint32_t read_len = 0;
-    err = Sdcard_ReadFile(path, readback, &read_len);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD card read failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    bool matches = (read_len == strlen(content)) && (memcmp(readback, content, read_len) == 0);
-    ESP_LOGI(TAG, "SD card write/read %s (%u bytes)", matches ? "OK" : "MISMATCH", (unsigned)read_len);
-}
-
 // ---------------------------------------------------------------------
 // Deep sleep: hold VBAT, EXT1 wake on BOOT/PWR/RTC-INT.
 // ---------------------------------------------------------------------
@@ -1438,37 +1435,12 @@ static void pending_voice_path_for_seq(uint32_t seq, char *out_path, size_t out_
     snprintf(out_path, out_path_len, "%s/%010u.pv", PENDING_VOICE_DIR, (unsigned)seq);
 }
 
-// Single opendir pass: smallest/largest sequence number currently queued,
-// and how many entries there are. Directory not existing yet reads the
-// same as "empty" (count=0) -- callers create it lazily on first save.
-static void pending_voice_scan(uint32_t *out_min_seq, uint32_t *out_max_seq, int *out_count) {
-    *out_count = 0;
-    *out_min_seq = 0;
-    *out_max_seq = 0;
-    DIR *dir = opendir(PENDING_VOICE_DIR);
-    if (!dir) {
-        return;
-    }
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        uint32_t seq;
-        if (!pending_voice_filename_seq(entry->d_name, &seq)) {
-            continue;
-        }
-        if (*out_count == 0 || seq < *out_min_seq) {
-            *out_min_seq = seq;
-        }
-        if (*out_count == 0 || seq > *out_max_seq) {
-            *out_max_seq = seq;
-        }
-        (*out_count)++;
-    }
-    closedir(dir);
-}
-
-// Collects every queued sequence number (bounded by PENDING_VOICE_MAX_QUEUED,
-// so a fixed-size caller array is safe) and sorts ascending -- oldest first,
-// insertion sort since there are never more than 15 entries.
+// Single opendir pass: collects every queued sequence number (bounded by
+// PENDING_VOICE_MAX_QUEUED, so a fixed-size caller array is safe) and sorts
+// ascending -- oldest first, insertion sort since there are never more than
+// 15 entries. Directory not existing yet reads the same as "empty"
+// (count=0) -- callers create it lazily on first save. Callers that only
+// need the oldest/newest entry read out_seqs[0]/out_seqs[count-1].
 static int pending_voice_list_sorted(uint32_t *out_seqs, int max_out) {
     DIR *dir = opendir(PENDING_VOICE_DIR);
     if (!dir) {
@@ -1501,9 +1473,8 @@ static void draw_pending_voice_indicator(void) {
     if (!ensure_sdcard_mounted()) {
         return;
     }
-    uint32_t min_seq, max_seq;
-    int count;
-    pending_voice_scan(&min_seq, &max_seq, &count);
+    uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
+    int count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
     if (count == 0) {
         return;
     }
@@ -1914,11 +1885,7 @@ static void handle_reminder_only_wake(pcf85063a_dev_t *rtc_dev) {
         strncpy(reminder_item.label, soonest.message, sizeof(reminder_item.label) - 1);
         reminder_item.label[sizeof(reminder_item.label) - 1] = '\0';
 
-        eink_ensure_initialized();
-        EPD_Clear();
-        draw_status_bar(s_last_screen.has_weather, s_last_screen.weather, battery_pct, nullptr);
-        draw_dashboard(reminder_item);
-        EPD_Display();
+        draw_reminder_override_screen(s_last_screen.has_weather, s_last_screen.weather, battery_pct, reminder_item);
         ESP_LOGI(TAG, "e-ink render done (reminder-override, reminder-only wake)");
 
         s_last_screen.is_checkin = false;
@@ -2030,6 +1997,100 @@ static size_t record_until_stopped(FILE *out_file) {
     return mono_bytes_written;
 }
 
+static const char *VOICE_MULTIPART_BOUNDARY = "----adhiVoiceBoundary7f3a";
+
+struct voice_multipart_parts_t {
+    char checkin_part[192];
+    int checkin_part_len;
+    char preamble[192];
+    int preamble_len;
+    char epilogue[64];
+    int epilogue_len;
+    wav_header_t wav_hdr;
+    size_t content_length;
+};
+
+// Pure computation, no I/O -- builds the multipart preamble/epilogue (and
+// the optional checkin_id field, F7) plus the WAV header and total
+// content-length, split out from upload_voice_note_from_file() so that
+// function's body is just the network/file streaming steps.
+static voice_multipart_parts_t build_voice_multipart_parts(const char *checkin_id, uint32_t mono_bytes) {
+    voice_multipart_parts_t parts = {};
+
+    if (checkin_id && checkin_id[0] != '\0') {
+        parts.checkin_part_len = snprintf(parts.checkin_part, sizeof(parts.checkin_part),
+                                           "--%s\r\n"
+                                           "Content-Disposition: form-data; name=\"checkin_id\"\r\n"
+                                           "\r\n"
+                                           "%s\r\n",
+                                           VOICE_MULTIPART_BOUNDARY, checkin_id);
+    }
+
+    parts.preamble_len = snprintf(parts.preamble, sizeof(parts.preamble),
+                                   "--%s\r\n"
+                                   "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n"
+                                   "Content-Type: audio/wav\r\n"
+                                   "\r\n",
+                                   VOICE_MULTIPART_BOUNDARY);
+
+    parts.epilogue_len = snprintf(parts.epilogue, sizeof(parts.epilogue), "\r\n--%s--\r\n", VOICE_MULTIPART_BOUNDARY);
+
+    parts.wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, mono_bytes);
+    parts.content_length =
+        (size_t)parts.checkin_part_len + (size_t)parts.preamble_len + sizeof(parts.wav_hdr) + mono_bytes + (size_t)parts.epilogue_len;
+    return parts;
+}
+
+// Writes the multipart body (checkin_id field if present, file-part
+// preamble, WAV header, chunked PCM read off SD, epilogue) to an
+// already-open esp_http_client connection. Takes ownership of f -- always
+// closes it before returning, success or failure. Logs its own failure
+// reason (chunk-buffer allocation vs. a write failing partway through) so
+// the caller doesn't need to.
+static bool stream_voice_multipart_body(esp_http_client_handle_t client, FILE *f, uint32_t mono_bytes,
+                                         const voice_multipart_parts_t &parts) {
+    bool write_ok = true;
+    if (parts.checkin_part_len > 0) {
+        write_ok = write_ok && esp_http_client_write(client, parts.checkin_part, parts.checkin_part_len) >= 0;
+    }
+    write_ok = write_ok && esp_http_client_write(client, parts.preamble, parts.preamble_len) >= 0;
+    write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(&parts.wav_hdr), sizeof(parts.wav_hdr)) >= 0;
+
+    // Chunked read straight off SD -- must be heap/PSRAM-allocated, not a
+    // stack local: the main task stack is only 8192 bytes total, and an
+    // 8KB stack array alone nearly fills it, which crashed outright on
+    // real hardware (silent panic, no error logged first -- a stack
+    // overflow, unlike the SPI-reinit crash found earlier, which did log
+    // before aborting).
+    const size_t READ_CHUNK_BYTES = 8192;
+    auto *chunk = static_cast<uint8_t *>(heap_caps_malloc(READ_CHUNK_BYTES, MALLOC_CAP_SPIRAM));
+    if (!chunk) {
+        ESP_LOGE(TAG, "/voice: failed to allocate upload chunk buffer");
+        fclose(f);
+        return false;
+    }
+
+    uint32_t remaining = mono_bytes;
+    while (write_ok && remaining > 0) {
+        size_t want = remaining < READ_CHUNK_BYTES ? remaining : READ_CHUNK_BYTES;
+        size_t got = fread(chunk, 1, want, f);
+        if (got == 0) {
+            write_ok = false;
+            break;
+        }
+        write_ok = esp_http_client_write(client, reinterpret_cast<const char *>(chunk), (int)got) >= 0;
+        remaining -= (uint32_t)got;
+    }
+    heap_caps_free(chunk);
+    fclose(f);
+
+    write_ok = write_ok && esp_http_client_write(client, parts.epilogue, parts.epilogue_len) >= 0;
+    if (!write_ok) {
+        ESP_LOGE(TAG, "/voice: write failed mid-upload");
+    }
+    return write_ok;
+}
+
 // POST /voice multipart. field name must be exactly "file" (matches
 // adhi-backend/voice.py's `file: UploadFile = File(...)`); never sends
 // one_shot/sync (spec section 3.2 / voice.py's own docstring: testing-only,
@@ -2057,36 +2118,10 @@ static size_t record_until_stopped(FILE *out_file) {
 // (spec section 3.2) so the backend routes the reply to that check-in
 // instead of resolving it by keyword/recency.
 static bool upload_voice_note_from_file(const char *mono_pcm_path, uint32_t mono_bytes, const char *checkin_id) {
-    const char *boundary = "----adhiVoiceBoundary7f3a";
-
-    char checkin_part[192] = {0};
-    int checkin_part_len = 0;
-    if (checkin_id && checkin_id[0] != '\0') {
-        checkin_part_len = snprintf(checkin_part, sizeof(checkin_part),
-                                     "--%s\r\n"
-                                     "Content-Disposition: form-data; name=\"checkin_id\"\r\n"
-                                     "\r\n"
-                                     "%s\r\n",
-                                     boundary, checkin_id);
-    }
-
-    char preamble[192];
-    int preamble_len = snprintf(preamble, sizeof(preamble),
-                                 "--%s\r\n"
-                                 "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n"
-                                 "Content-Type: audio/wav\r\n"
-                                 "\r\n",
-                                 boundary);
-
-    char epilogue[64];
-    int epilogue_len = snprintf(epilogue, sizeof(epilogue), "\r\n--%s--\r\n", boundary);
-
-    wav_header_t wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, mono_bytes);
-
-    size_t content_length = (size_t)checkin_part_len + (size_t)preamble_len + sizeof(wav_hdr) + mono_bytes + (size_t)epilogue_len;
+    voice_multipart_parts_t parts = build_voice_multipart_parts(checkin_id, mono_bytes);
 
     char content_type_header[64];
-    snprintf(content_type_header, sizeof(content_type_header), "multipart/form-data; boundary=%s", boundary);
+    snprintf(content_type_header, sizeof(content_type_header), "multipart/form-data; boundary=%s", VOICE_MULTIPART_BOUNDARY);
 
     char url[256];
     snprintf(url, sizeof(url), "%s/voice", BACKEND_BASE_URL);
@@ -2117,7 +2152,7 @@ static bool upload_voice_note_from_file(const char *mono_pcm_path, uint32_t mono
     esp_http_client_set_header(client, "auth", API_TOKEN);
     esp_http_client_set_header(client, "Content-Type", content_type_header);
 
-    esp_err_t err = esp_http_client_open(client, (int)content_length);
+    esp_err_t err = esp_http_client_open(client, (int)parts.content_length);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "/voice: failed to open connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
@@ -2125,46 +2160,7 @@ static bool upload_voice_note_from_file(const char *mono_pcm_path, uint32_t mono
         return false;
     }
 
-    bool write_ok = true;
-    if (checkin_part_len > 0) {
-        write_ok = write_ok && esp_http_client_write(client, checkin_part, checkin_part_len) >= 0;
-    }
-    write_ok = write_ok && esp_http_client_write(client, preamble, preamble_len) >= 0;
-    write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(&wav_hdr), sizeof(wav_hdr)) >= 0;
-
-    // Chunked read straight off SD -- must be heap/PSRAM-allocated, not a
-    // stack local: the main task stack is only 8192 bytes total, and an
-    // 8KB stack array alone nearly fills it, which crashed outright on
-    // real hardware (silent panic, no error logged first -- a stack
-    // overflow, unlike the SPI-reinit crash found earlier, which did log
-    // before aborting).
-    const size_t READ_CHUNK_BYTES = 8192;
-    auto *chunk = static_cast<uint8_t *>(heap_caps_malloc(READ_CHUNK_BYTES, MALLOC_CAP_SPIRAM));
-    if (!chunk) {
-        ESP_LOGE(TAG, "/voice: failed to allocate upload chunk buffer");
-        esp_http_client_cleanup(client);
-        fclose(f);
-        return false;
-    }
-
-    uint32_t remaining = mono_bytes;
-    while (write_ok && remaining > 0) {
-        size_t want = remaining < READ_CHUNK_BYTES ? remaining : READ_CHUNK_BYTES;
-        size_t got = fread(chunk, 1, want, f);
-        if (got == 0) {
-            write_ok = false;
-            break;
-        }
-        write_ok = esp_http_client_write(client, reinterpret_cast<const char *>(chunk), (int)got) >= 0;
-        remaining -= (uint32_t)got;
-    }
-    heap_caps_free(chunk);
-    fclose(f);
-
-    write_ok = write_ok && esp_http_client_write(client, epilogue, epilogue_len) >= 0;
-
-    if (!write_ok) {
-        ESP_LOGE(TAG, "/voice: write failed mid-upload");
+    if (!stream_voice_multipart_body(client, f, mono_bytes, parts)) {
         esp_http_client_cleanup(client);
         return false;
     }
@@ -2172,7 +2168,7 @@ static bool upload_voice_note_from_file(const char *mono_pcm_path, uint32_t mono
     esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
     bool ok = (status >= 200 && status < 300);
-    ESP_LOGI(TAG, "/voice upload %s (status %d, %u bytes sent)", ok ? "OK" : "FAILED", status, (unsigned)content_length);
+    ESP_LOGI(TAG, "/voice upload %s (status %d, %u bytes sent)", ok ? "OK" : "FAILED", status, (unsigned)parts.content_length);
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
@@ -2264,25 +2260,11 @@ static bool skip_checkin(const char *checkin_id) {
     char url[256];
     snprintf(url, sizeof(url), "%s/device/checkin/%s/skip", BACKEND_BASE_URL, checkin_id);
 
-    esp_http_client_config_t config = {};
-    config.url = url;
-    config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 10000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "auth", API_TOKEN);
-
-    esp_err_t err = esp_http_client_perform(client);
-    bool ok = false;
-    if (err == ESP_OK) {
-        int status = esp_http_client_get_status_code(client);
-        ok = (status >= 200 && status < 300);
+    int status = -1;
+    bool ok = http_post(url, nullptr, nullptr, nullptr, &status);
+    if (status >= 0) {
         ESP_LOGI(TAG, "checkin skip %s (status %d)", ok ? "OK" : "FAILED", status);
-    } else {
-        ESP_LOGE(TAG, "checkin skip failed: %s", esp_err_to_name(err));
     }
-    esp_http_client_cleanup(client);
     return ok;
 }
 
@@ -2377,6 +2359,148 @@ static void run_power_off_cycle(void) {
     esp_deep_sleep_start();
 }
 
+struct ptt_recording_result_t {
+    bool have_pending_file;
+    char pending_path[64];
+    uint32_t pending_mono_bytes;
+};
+
+// Records one push-to-talk take straight to a new file under
+// PENDING_VOICE_DIR, using the same on-disk format/finalize sequence the
+// SD retry queue uses -- there's no separate "save on failure" step; a
+// failed upload just means this file, already correctly formatted, stays
+// where flush_pending_voice_notes() will find it on a later wake. Handles
+// its own SD mount, FIFO eviction, and "RECORDING FAILED" e-ink feedback
+// on any early-exit path; have_pending_file stays false whenever there's
+// nothing worth uploading (SD unavailable, header write failed, or a
+// zero-byte take).
+static ptt_recording_result_t record_ptt_take_to_pending_file(bool have_live_checkin) {
+    ptt_recording_result_t result = {};
+
+    if (!ensure_sdcard_mounted()) {
+        ESP_LOGE(TAG, "push-to-talk: SD card unavailable, cannot record");
+        eink_show_message("RECORDING FAILED");
+        return result;
+    }
+
+    mkdir(PENDING_VOICE_DIR, 0755); // ignore EEXIST -- already-there is the common case
+
+    uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
+    int count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
+    if (count >= PENDING_VOICE_MAX_QUEUED) {
+        char evict_path[64];
+        pending_voice_path_for_seq(seqs[0], evict_path, sizeof(evict_path));
+        remove(evict_path);
+    }
+    uint32_t new_seq = (count > 0) ? seqs[count - 1] + 1 : 1;
+    pending_voice_path_for_seq(new_seq, result.pending_path, sizeof(result.pending_path));
+
+    FILE *f = fopen(result.pending_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "push-to-talk: failed to open %s for recording", result.pending_path);
+        eink_show_message("RECORDING FAILED");
+        return result;
+    }
+
+    pending_voice_header_t hdr = {};
+    // magic left all-zero until the recording finishes normally -- see
+    // pending_voice_header_t's comment for why.
+    hdr.format_version = 1;
+    hdr.sample_rate = PTT_SAMPLE_RATE_HZ;
+    hdr.bits_per_sample = 16;
+    hdr.channels = 1;
+    hdr.mono_bytes = 0;
+    if (have_live_checkin) {
+        strncpy(hdr.checkin_id, s_last_screen.checkin_id, sizeof(hdr.checkin_id) - 1);
+        hdr.checkin_id[sizeof(hdr.checkin_id) - 1] = '\0';
+    }
+    bool header_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+    if (!header_ok) {
+        fclose(f);
+        remove(result.pending_path);
+        return result;
+    }
+
+    if (have_live_checkin) {
+        eink_show_checkin_recording(s_last_screen.checkin_prompt);
+    } else {
+        eink_show_message("RECORDING... PRESS BOOT TO STOP");
+    }
+
+    size_t recorded_bytes = record_until_stopped(f);
+    double recorded_seconds = (double)recorded_bytes / (PTT_SAMPLE_RATE_HZ * PTT_BYTES_PER_SAMPLE);
+    ESP_LOGI(TAG, "push-to-talk: recorded %u mono bytes (%.1fs)", (unsigned)recorded_bytes, recorded_seconds);
+
+    if (recorded_bytes == 0) {
+        fclose(f);
+        remove(result.pending_path);
+        return result;
+    }
+
+    // Finalize: patch magic + real byte count now that they're known. A
+    // file left with all-zero magic (e.g. power cut between here and the
+    // write completing) is unambiguously incomplete to
+    // flush_pending_voice_notes().
+    memcpy(hdr.magic, PENDING_VOICE_MAGIC, sizeof(hdr.magic));
+    hdr.mono_bytes = (uint32_t)recorded_bytes;
+    fseek(f, 0, SEEK_SET);
+    bool finalize_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+    fclose(f);
+    if (finalize_ok) {
+        result.have_pending_file = true;
+        result.pending_mono_bytes = (uint32_t)recorded_bytes;
+    } else {
+        remove(result.pending_path);
+    }
+    return result;
+}
+
+// Uploads a just-recorded pending voice note (fire-and-forget wifi
+// connect -> upload -> SENT/SAVED FOR RETRY feedback), then decides how to
+// leave the screen: a check-in reply invalidates s_last_screen so the next
+// real sync brings fresh content instead of redrawing an already-answered
+// prompt; a plain recording restores the normal screen after a few
+// seconds so the confirmation is actually visible first.
+static void upload_and_finish_ptt_take(const ptt_recording_result_t &rec, bool have_live_checkin, int battery_pct) {
+    // Immediate feedback that the stop (silence or button) actually
+    // registered -- found via hardware testing that wifi connect +
+    // upload can take 20s+, and staying on "RECORDING..." that whole
+    // time looks exactly like the stop didn't work.
+    eink_show_message("SENDING...");
+
+    bool wifi_ok = wifi_connect();
+    bool upload_ok = false;
+    if (wifi_ok) {
+        // F7: tag this reply to the live check-in, if one's showing,
+        // so the backend routes it to that check-in instead of
+        // resolving it by keyword/recency.
+        upload_ok = upload_voice_note_from_file(rec.pending_path, rec.pending_mono_bytes,
+                                                 have_live_checkin ? s_last_screen.checkin_id : nullptr);
+    } else {
+        ESP_LOGE(TAG, "push-to-talk: skipping upload -- wifi never connected");
+    }
+
+    if (upload_ok) {
+        remove(rec.pending_path);
+    }
+    eink_show_message(upload_ok ? "SENT" : "SAVED FOR RETRY");
+
+    if (have_live_checkin) {
+        // This reply resolves the check-in -- the persisted screen
+        // now describes something already answered, so redrawing it
+        // would make an already-replied-to prompt look like it's
+        // still pending. Leave the confirmation up instead (same
+        // reasoning as run_checkin_skip_cycle()); the next real sync
+        // brings fresh content.
+        s_last_screen.valid = false;
+    } else {
+        // Give the user a moment to actually see the confirmation
+        // before restoring the normal screen underneath it.
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        eink_render_last_known(battery_pct, nullptr);
+    }
+}
+
 static void run_push_to_talk_cycle(void) {
     ESP_LOGI(TAG, "push-to-talk: BOOT wake, starting voice cycle");
 
@@ -2419,127 +2543,9 @@ static void run_push_to_talk_cycle(void) {
     I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     Codec_StartInit();
 
-    // The recording streams straight to a file under PENDING_VOICE_DIR from
-    // the moment capture starts, using the same on-disk format the retry
-    // queue uses -- there's no separate "save on failure" step; a failed
-    // upload just means this file, already correctly formatted, stays
-    // where flush_pending_voice_notes() will find it on a later wake.
-    bool have_pending_file = false;
-    char pending_path[64] = "";
-    uint32_t pending_mono_bytes = 0;
-
-    if (!ensure_sdcard_mounted()) {
-        ESP_LOGE(TAG, "push-to-talk: SD card unavailable, cannot record");
-        eink_show_message("RECORDING FAILED");
-    } else {
-        mkdir(PENDING_VOICE_DIR, 0755); // ignore EEXIST -- already-there is the common case
-
-        uint32_t min_seq, max_seq;
-        int count;
-        pending_voice_scan(&min_seq, &max_seq, &count);
-        if (count >= PENDING_VOICE_MAX_QUEUED) {
-            char evict_path[64];
-            pending_voice_path_for_seq(min_seq, evict_path, sizeof(evict_path));
-            remove(evict_path);
-        }
-        uint32_t new_seq = (count > 0) ? max_seq + 1 : 1;
-        pending_voice_path_for_seq(new_seq, pending_path, sizeof(pending_path));
-
-        FILE *f = fopen(pending_path, "wb");
-        if (!f) {
-            ESP_LOGE(TAG, "push-to-talk: failed to open %s for recording", pending_path);
-            eink_show_message("RECORDING FAILED");
-        } else {
-            pending_voice_header_t hdr = {};
-            // magic left all-zero until the recording finishes normally --
-            // see pending_voice_header_t's comment for why.
-            hdr.format_version = 1;
-            hdr.sample_rate = PTT_SAMPLE_RATE_HZ;
-            hdr.bits_per_sample = 16;
-            hdr.channels = 1;
-            hdr.mono_bytes = 0;
-            if (have_live_checkin) {
-                strncpy(hdr.checkin_id, s_last_screen.checkin_id, sizeof(hdr.checkin_id) - 1);
-                hdr.checkin_id[sizeof(hdr.checkin_id) - 1] = '\0';
-            }
-            bool header_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
-
-            if (header_ok) {
-                if (have_live_checkin) {
-                    eink_show_checkin_recording(s_last_screen.checkin_prompt);
-                } else {
-                    eink_show_message("RECORDING... PRESS BOOT TO STOP");
-                }
-
-                size_t recorded_bytes = record_until_stopped(f);
-                double recorded_seconds = (double)recorded_bytes / (PTT_SAMPLE_RATE_HZ * PTT_BYTES_PER_SAMPLE);
-                ESP_LOGI(TAG, "push-to-talk: recorded %u mono bytes (%.1fs)", (unsigned)recorded_bytes, recorded_seconds);
-
-                if (recorded_bytes == 0) {
-                    fclose(f);
-                    remove(pending_path);
-                } else {
-                    // Finalize: patch magic + real byte count now that
-                    // they're known. A file left with all-zero magic (e.g.
-                    // power cut between here and the write completing) is
-                    // unambiguously incomplete to flush_pending_voice_notes().
-                    memcpy(hdr.magic, PENDING_VOICE_MAGIC, sizeof(hdr.magic));
-                    hdr.mono_bytes = (uint32_t)recorded_bytes;
-                    fseek(f, 0, SEEK_SET);
-                    bool finalize_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
-                    fclose(f);
-                    if (finalize_ok) {
-                        have_pending_file = true;
-                        pending_mono_bytes = (uint32_t)recorded_bytes;
-                    } else {
-                        remove(pending_path);
-                    }
-                }
-            } else {
-                fclose(f);
-                remove(pending_path);
-            }
-        }
-    }
-
-    if (have_pending_file) {
-        // Immediate feedback that the stop (silence or button) actually
-        // registered -- found via hardware testing that wifi connect +
-        // upload can take 20s+, and staying on "RECORDING..." that whole
-        // time looks exactly like the stop didn't work.
-        eink_show_message("SENDING...");
-
-        bool wifi_ok = wifi_connect();
-        bool upload_ok = false;
-        if (wifi_ok) {
-            // F7: tag this reply to the live check-in, if one's showing,
-            // so the backend routes it to that check-in instead of
-            // resolving it by keyword/recency.
-            upload_ok = upload_voice_note_from_file(pending_path, pending_mono_bytes,
-                                                     have_live_checkin ? s_last_screen.checkin_id : nullptr);
-        } else {
-            ESP_LOGE(TAG, "push-to-talk: skipping upload -- wifi never connected");
-        }
-
-        if (upload_ok) {
-            remove(pending_path);
-        }
-        eink_show_message(upload_ok ? "SENT" : "SAVED FOR RETRY");
-
-        if (have_live_checkin) {
-            // This reply resolves the check-in -- the persisted screen
-            // now describes something already answered, so redrawing it
-            // would make an already-replied-to prompt look like it's
-            // still pending. Leave the confirmation up instead (same
-            // reasoning as run_checkin_skip_cycle()); the next real sync
-            // brings fresh content.
-            s_last_screen.valid = false;
-        } else {
-            // Give the user a moment to actually see the confirmation
-            // before restoring the normal screen underneath it.
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            eink_render_last_known(battery_pct, nullptr);
-        }
+    ptt_recording_result_t rec = record_ptt_take_to_pending_file(have_live_checkin);
+    if (rec.have_pending_file) {
+        upload_and_finish_ptt_take(rec, have_live_checkin, battery_pct);
     }
 
     // The regular sync cadence is untouched here -- no
@@ -2813,8 +2819,6 @@ extern "C" void app_main(void) {
     if (snap) {
         heap_caps_free(snap);
     }
-
-    sdcard_test();
 
     int effective_poll_interval = sync_effective_poll_interval(
         s_has_synced_ever, s_last_known_good_poll_interval, FALLBACK_POLL_INTERVAL_SECONDS);
