@@ -32,8 +32,11 @@ Almost all firmware logic lives in `main/adhi-firmware.cpp`, with board support 
 
 A dual-purpose device, one physical board (Waveshare ESP32-S3-ePaper-1.54 V2, non-touch):
 
-1. **Push-to-talk voice input** — press a button, speak, release; audio uploads to the
-   backend fire-and-forget (no reply over HTTP, ever).
+1. **Push-to-talk voice input** — press a button, speak, release; audio streams straight to
+   an SD-card file as it's captured (not buffered in PSRAM — recordings can run several
+   minutes) and uploads to the backend fire-and-forget (no reply over HTTP, ever). A recording
+   whose upload fails (no wifi, or the backend unreachable) stays queued on the SD card and is
+   retried automatically on a later wake — see the non-goals section below for its bounds.
 2. **Periodic deep-sleep sync + eink display** — wakes on an RTC alarm, pulls a 24h snapshot
    (check-ins, reminders, calendar events, weather) from the backend, renders it to the eink
    display, goes back to sleep.
@@ -66,7 +69,13 @@ loop, crash, or sync failure burn battery or brick the device.
   - `POST /voice` — multipart audio upload (16kHz/mono/16-bit PCM WAV recommended). Response
     is `202` with an **empty body** — fire-and-forget by design. Never send `one_shot`/`sync`
     form fields (dashboard-testing-only; `sync` would hold the connection open for the full
-    pipeline duration, defeating the design). No code path should wait for a reply.
+    pipeline duration, defeating the design). No code path should wait for a reply. Upload
+    timeout is sized dynamically from payload length, not a flat constant (a fixed timeout
+    proved too short for longer recordings — see `voice_upload_timeout_ms()` in
+    `main/adhi-firmware.cpp`). Still only one upload attempt per recording per wake cycle (no
+    bounded-retry loop within a single wake, unlike `/device/sync` below) — a failed attempt is
+    instead persisted to `/sdcard/pending_voice/` and retried, one attempt each, on every later
+    wake that has wifi. See the "Explicit non-goals for v1" section for the queue's bounds.
   - `POST /device/checkin/{checkin_id}/skip` — dismiss a live check-in. Note: this is
     distinct from `POST /checkin/{checkin_id}/skip` (no `/device` prefix), which is a
     different backend flow that doesn't accept the device auth token.
@@ -111,5 +120,13 @@ separate follow-up commit.
 
 - No OTA updates (no OTA partition slot — reflash only).
 - No multi-device/fleet concept (backend assumes exactly one device).
-- No offline queueing or delta sync (every sync is a fresh full snapshot).
+- No offline queueing or delta sync **for `/device/sync`** (every sync is a fresh full 24h
+  snapshot — no delta/cursor concept). **Exception:** failed push-to-talk voice-note uploads
+  (`/voice`, see the backend network contract above) *are* queued to the SD card
+  (`/sdcard/pending_voice/`, `flush_pending_voice_notes()` in `main/adhi-firmware.cpp`) and
+  retried automatically. This is a deliberately narrow, bounded exception: max 15 pending notes
+  (oldest evicted FIFO past that), exactly one retry attempt per note per wake (no per-note
+  backoff loop, no reuse of `sync_backoff.c/h`), a 5-minute total connected-upload-time budget
+  per wake across all queued notes, and no expiry by age or attempt count. It does not apply to
+  `/device/sync`, which remains fully stateless with no delta/offline-queue concept at all.
 - No synthesized TTS reply (`/voice` has no response content at all).

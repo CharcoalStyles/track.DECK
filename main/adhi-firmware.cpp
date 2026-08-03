@@ -83,7 +83,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.3.1-crt-bundle"
+#define FIRMWARE_VERSION "0.4.0-voice-retry-queue"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -1016,6 +1016,13 @@ static RTC_DATA_ATTR bool s_next_wake_is_reminder_only = false;
 // snapshot -- accepted limitation, see PROJECT_PLAN.md's F9 entry.
 static RTC_DATA_ATTR char s_last_announced_reminder_id[SYNC_STR_ID_LEN] = "";
 
+// Bottom-right "N/15" queued-voice-note indicator -- forward-declared here
+// since eink_render()/eink_render_last_known() below need to call it, but
+// its body (defined down in the voice-note SD retry queue section) needs
+// ensure_sdcard_mounted()/pending_voice_scan()/PENDING_VOICE_MAX_QUEUED,
+// none of which are visible yet at this point in the file.
+static void draw_pending_voice_indicator(void);
+
 // F9: override_reminder is non-null only when handle_due_reminder() just
 // fired this cycle -- a reminder that just activated always takes over
 // the screen from a live check-in, unconditionally. Built directly from
@@ -1043,12 +1050,18 @@ static void eink_render(const sync_snapshot_t &snap, int battery_pct, const sync
     const char *render_kind;
     if (override_reminder) {
         draw_dashboard(reminder_item);
+        draw_pending_voice_indicator();
         render_kind = "reminder-override";
     } else if (live_checkin) {
         draw_checkin(live_checkin->prompt_text);
+        // No indicator here -- a live check-in deliberately takes over the
+        // whole screen (see this function's header comment), and its
+        // wrapped prompt text can already run all the way to the bottom
+        // edge (draw_checkin()'s own comment on its 14-line cap).
         render_kind = "check-in";
     } else {
         draw_dashboard(next);
+        draw_pending_voice_indicator();
         render_kind = "dashboard";
     }
 
@@ -1090,7 +1103,10 @@ static void eink_render_last_known(int battery_pct, const char *notice) {
             draw_checkin(s_last_screen.checkin_prompt);
         } else {
             draw_dashboard(s_last_screen.next);
+            draw_pending_voice_indicator();
         }
+    } else {
+        draw_pending_voice_indicator();
     }
 
     EPD_Display();
@@ -1310,7 +1326,14 @@ static void enter_deep_sleep(void) {
                         // in codec_board); downmixed to mono at upload time.
 #define PTT_BYTES_PER_SAMPLE 2
 #define PTT_CHUNK_MS 200
-#define PTT_MAX_RECORD_MS 60000  // hard safety cap regardless of the two below
+// 5 minutes -- was 60000 (60s), raised now that recording streams to SD
+// instead of one PSRAM buffer (this board's 8MB total PSRAM couldn't hold
+// more than ~90s of stereo audio as a single allocation; SD card capacity
+// isn't a meaningful constraint by comparison). A full-length recording at
+// this cap does take real time and battery to upload afterward -- see
+// expected_upload_ms()'s comment -- that's an inherent cost of supporting
+// this length, not a bug.
+#define PTT_MAX_RECORD_MS 300000  // hard safety cap regardless of the two below
 #define PTT_SILENCE_WARMUP_MS 1500 // grace period before silence counts, so
                                     // the user has a moment to start talking
 #define PTT_SILENCE_STOP_MS 2000   // auto-stop after this much continuous quiet
@@ -1361,6 +1384,154 @@ static wav_header_t build_wav_header(uint32_t sample_rate, uint16_t num_channels
     memcpy(hdr.data_tag, "data", 4);
     hdr.data_length = data_length;
     return hdr;
+}
+
+// ---------------------------------------------------------------------
+// Voice-note SD retry queue. A push-to-talk recording streams straight to
+// a file under PENDING_VOICE_DIR from the moment capture starts (see
+// record_until_stopped() below) -- the recording *is* the queue entry,
+// not a separate save-on-failure step. A live upload attempt streams from
+// that same file; on success the file is deleted, on failure it's already
+// sitting in the queue directory, correctly formatted, for
+// flush_pending_voice_notes() to retry on a later wake. Bounded to 15
+// pending notes (oldest evicted FIFO), one upload attempt per note per
+// wake, no expiry by age -- a note is retried forever until it succeeds
+// or is evicted.
+// ---------------------------------------------------------------------
+
+#define PENDING_VOICE_DIR SDlist "/pending_voice"
+#define PENDING_VOICE_MAX_QUEUED 15
+#define PENDING_VOICE_MAGIC "APVQ"
+
+#pragma pack(push, 1)
+struct pending_voice_header_t {
+    char magic[4];             // "APVQ" once finalized; all-zero while recording is still in
+                                // progress, so a file left behind by a power cut mid-recording
+                                // is unambiguously incomplete and gets cleaned up, not retried.
+    uint8_t format_version;    // 1
+    uint32_t sample_rate;      // PTT_SAMPLE_RATE_HZ at record time
+    uint8_t bits_per_sample;   // 16
+    uint8_t channels;          // 1 (always -- downmix happens per-chunk during capture)
+    uint32_t mono_bytes;       // payload length following this header; 0 until finalized
+    char checkin_id[SYNC_STR_ID_LEN]; // "" if this recording wasn't a reply to a live check-in
+};
+#pragma pack(pop)
+
+// Only usable entries -- exactly 10 digits + ".pv" -- are ever seq-parsed;
+// anything else (stray dotfiles, partial writes with a different name) is
+// simply invisible to the queue rather than tripping up the scan.
+static bool pending_voice_filename_seq(const char *name, uint32_t *out_seq) {
+    size_t len = strlen(name);
+    if (len != 13 || strcmp(name + 10, ".pv") != 0) {
+        return false;
+    }
+    for (int i = 0; i < 10; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    *out_seq = (uint32_t)strtoul(name, nullptr, 10);
+    return true;
+}
+
+static void pending_voice_path_for_seq(uint32_t seq, char *out_path, size_t out_path_len) {
+    snprintf(out_path, out_path_len, "%s/%010u.pv", PENDING_VOICE_DIR, (unsigned)seq);
+}
+
+// Single opendir pass: smallest/largest sequence number currently queued,
+// and how many entries there are. Directory not existing yet reads the
+// same as "empty" (count=0) -- callers create it lazily on first save.
+static void pending_voice_scan(uint32_t *out_min_seq, uint32_t *out_max_seq, int *out_count) {
+    *out_count = 0;
+    *out_min_seq = 0;
+    *out_max_seq = 0;
+    DIR *dir = opendir(PENDING_VOICE_DIR);
+    if (!dir) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        uint32_t seq;
+        if (!pending_voice_filename_seq(entry->d_name, &seq)) {
+            continue;
+        }
+        if (*out_count == 0 || seq < *out_min_seq) {
+            *out_min_seq = seq;
+        }
+        if (*out_count == 0 || seq > *out_max_seq) {
+            *out_max_seq = seq;
+        }
+        (*out_count)++;
+    }
+    closedir(dir);
+}
+
+// Collects every queued sequence number (bounded by PENDING_VOICE_MAX_QUEUED,
+// so a fixed-size caller array is safe) and sorts ascending -- oldest first,
+// insertion sort since there are never more than 15 entries.
+static int pending_voice_list_sorted(uint32_t *out_seqs, int max_out) {
+    DIR *dir = opendir(PENDING_VOICE_DIR);
+    if (!dir) {
+        return 0;
+    }
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr && count < max_out) {
+        uint32_t seq;
+        if (!pending_voice_filename_seq(entry->d_name, &seq)) {
+            continue;
+        }
+        int pos = count;
+        while (pos > 0 && out_seqs[pos - 1] > seq) {
+            out_seqs[pos] = out_seqs[pos - 1];
+            pos--;
+        }
+        out_seqs[pos] = seq;
+        count++;
+    }
+    closedir(dir);
+    return count;
+}
+
+// Bottom-right "N/15" indicator (scale 1), body of the forward declaration
+// above eink_render(). Silent (draws nothing) when the queue is empty, so
+// the normal screen is untouched on the common case of every recording
+// having uploaded fine.
+static void draw_pending_voice_indicator(void) {
+    if (!ensure_sdcard_mounted()) {
+        return;
+    }
+    uint32_t min_seq, max_seq;
+    int count;
+    pending_voice_scan(&min_seq, &max_seq, &count);
+    if (count == 0) {
+        return;
+    }
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d/%d", count, PENDING_VOICE_MAX_QUEUED);
+    int w = (int)strlen(buf) * (FONT_GLYPH_W + 1);
+    draw_text(buf, EPD_WIDTH - w - 4, EPD_HEIGHT - FONT_GLYPH_H - 4, 1, DRIVER_COLOR_BLACK);
+}
+
+// Two different numbers, deliberately not conflated: expected_upload_ms()
+// is a plain estimate (no safety margin) used only to decide how many
+// queued notes fit in one wake's flush budget -- see
+// flush_pending_voice_notes(). voice_upload_timeout_ms() is the actual
+// esp_http_client timeout, padded so a genuinely slower-than-observed
+// connection doesn't get killed as a false negative (the same failure mode
+// that made the original flat 60s constant insufficient for a full-length
+// recording -- 384KB measured taking ~15.9s on real hardware, ~24.7KB/s,
+// which scales to ~78s for a full 60s/1.92MB-mono recording).
+static int64_t expected_upload_ms(uint32_t mono_bytes) {
+    const int64_t EXPECTED_BYTES_PER_SEC = 25000; // rounds the ~24.7KB/s observed
+    const int64_t EXPECTED_BASE_MS = 3000;         // typical connection-setup overhead
+    return EXPECTED_BASE_MS + (int64_t)mono_bytes * 1000 / EXPECTED_BYTES_PER_SEC;
+}
+
+static int voice_upload_timeout_ms(uint32_t mono_bytes) {
+    const double SAFETY_MULTIPLIER = 1.35;  // cushion against slower-than-observed throughput
+    const int64_t SAFETY_MARGIN_MS = 10000; // flat pad for connection-setup variance
+    return (int)((double)expected_upload_ms(mono_bytes) * SAFETY_MULTIPLIER) + SAFETY_MARGIN_MS;
 }
 
 // ---------------------------------------------------------------------
@@ -1757,13 +1928,17 @@ static void handle_reminder_only_wake(pcf85063a_dev_t *rtc_dev) {
     schedule_next_wake_and_sleep(rtc_dev); // never returns
 }
 
-// Records into buf (capacity max_bytes, stereo/16-bit PCM) in ~200ms
-// chunks, stopping on whichever of three independent conditions fires
-// first: a second BOOT press, ~2s of continuous silence (after an
-// initial warm-up grace period), or the hard 60s cap. Returns the number
-// of bytes actually recorded.
-static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
-    const size_t chunk_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_CHUNK_MS / 1000;
+// Records in ~200ms chunks, downmixing each chunk to mono and streaming it
+// straight to out_file as it's captured -- streaming to SD instead of
+// accumulating one big PSRAM buffer is what decouples recording length
+// from PSRAM size (this board's PSRAM is only 8MB total, PROJECT_PLAN.md:131;
+// a multi-minute stereo buffer wouldn't fit). Stops on whichever of three
+// independent conditions fires first: a second BOOT press, ~2s of
+// continuous silence (after an initial warm-up grace period), or the hard
+// PTT_MAX_RECORD_MS cap. Returns the number of mono bytes actually written.
+static size_t record_until_stopped(FILE *out_file) {
+    const size_t stereo_chunk_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_CHUNK_MS / 1000;
+    const size_t mono_chunk_bytes = stereo_chunk_bytes / 2;
 
     // Callers only ever reach here after wait_for_tap_or_hold() has
     // already confirmed the original wake-press was a tap (i.e. already
@@ -1787,26 +1962,53 @@ static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
         stop_requested = true;
     });
 
-    size_t recorded_bytes = 0;
+    // Small, reused-every-chunk buffers -- this is now the *only* PSRAM the
+    // recording path needs (a few KB total, versus megabytes when the
+    // whole recording was buffered in memory before upload).
+    auto *stereo_chunk = static_cast<int16_t *>(heap_caps_malloc(stereo_chunk_bytes, MALLOC_CAP_SPIRAM));
+    auto *mono_chunk = static_cast<int16_t *>(heap_caps_malloc(mono_chunk_bytes, MALLOC_CAP_SPIRAM));
+    if (!stereo_chunk || !mono_chunk) {
+        ESP_LOGE(TAG, "ptt: failed to allocate recording chunk buffers");
+        if (stereo_chunk) heap_caps_free(stereo_chunk);
+        if (mono_chunk) heap_caps_free(mono_chunk);
+        return 0;
+    }
+
+    size_t mono_bytes_written = 0;
     int elapsed_ms = 0;
     int silence_ms = 0;
+    bool write_ok = true;
 
-    while (recorded_bytes + chunk_bytes <= max_bytes) {
-        Codec_RecordData(buf + recorded_bytes, chunk_bytes);
-        recorded_bytes += chunk_bytes;
+    while (write_ok) {
+        Codec_RecordData(reinterpret_cast<uint8_t *>(stereo_chunk), stereo_chunk_bytes);
         elapsed_ms += PTT_CHUNK_MS;
 
-        const int16_t *samples = reinterpret_cast<const int16_t *>(buf + recorded_bytes - chunk_bytes);
-        size_t sample_count = chunk_bytes / sizeof(int16_t);
+        size_t stereo_sample_count = stereo_chunk_bytes / sizeof(int16_t);
         int64_t sum_sq = 0;
-        for (size_t i = 0; i < sample_count; i++) {
-            sum_sq += (int64_t)samples[i] * samples[i];
+        for (size_t i = 0; i < stereo_sample_count; i++) {
+            sum_sq += (int64_t)stereo_chunk[i] * stereo_chunk[i];
         }
-        float rms = sqrtf((float)sum_sq / (float)sample_count);
+        float rms = sqrtf((float)sum_sq / (float)stereo_sample_count);
         ESP_LOGD(TAG, "ptt chunk rms=%.1f elapsed_ms=%d silence_ms=%d", (double)rms, elapsed_ms, silence_ms);
 
         if (elapsed_ms > PTT_SILENCE_WARMUP_MS) {
             silence_ms = (rms < PTT_SILENCE_RMS_THRESHOLD) ? (silence_ms + PTT_CHUNK_MS) : 0;
+        }
+
+        // Same average-L+R downmix math used everywhere else in this file
+        // for stereo->mono conversion.
+        size_t mono_frame_count = stereo_chunk_bytes / (PTT_CHANNELS * sizeof(int16_t));
+        for (size_t i = 0; i < mono_frame_count; i++) {
+            int16_t l = stereo_chunk[i * 2];
+            int16_t r = stereo_chunk[i * 2 + 1];
+            mono_chunk[i] = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+        }
+        write_ok = fwrite(mono_chunk, 1, mono_chunk_bytes, out_file) == mono_chunk_bytes;
+        if (write_ok) {
+            mono_bytes_written += mono_chunk_bytes;
+        } else {
+            ESP_LOGE(TAG, "ptt: SD write failed mid-recording");
+            break;
         }
 
         if (stop_requested) {
@@ -1823,7 +2025,9 @@ static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
         }
     }
 
-    return recorded_bytes;
+    heap_caps_free(stereo_chunk);
+    heap_caps_free(mono_chunk);
+    return mono_bytes_written;
 }
 
 // POST /voice multipart. field name must be exactly "file" (matches
@@ -1834,19 +2038,25 @@ static size_t record_until_stopped(uint8_t *buf, size_t max_bytes) {
 // open()/write()/fetch_headers() rather than the single-buffer
 // set_post_field() pattern device_sync_attempt() uses, since the body
 // here (WAV header + audio) is too large to comfortably build as one
-// contiguous string first. The stereo capture is downmixed to real mono
-// (average L+R per sample) while streaming, rather than requiring a
-// second full-size buffer -- halves the upload for no quality loss and
-// matches the spec's stated recommendation. No retry loop: unlike
-// /device/sync, voice failures are already designed to be silent/
-// best-effort backend-side (spec's fire-and-forget framing), so one
-// attempt is enough.
+// contiguous string first. No retry loop: unlike /device/sync, voice
+// failures are already designed to be silent/best-effort backend-side
+// (spec's fire-and-forget framing), so one attempt is enough here -- a
+// failed attempt leaves the file in place under PENDING_VOICE_DIR for
+// flush_pending_voice_notes() to retry on a later wake.
+//
+// Streams the mono PCM payload straight from an already-downmixed file on
+// SD (mono_pcm_path, produced either by record_until_stopped() live or
+// already sitting queued from a previous failed attempt) rather than a
+// memory buffer -- mirrors the established fopen -> seek-past-header ->
+// chunked fread pattern already used by play_wav_file() elsewhere in this
+// file, so there's exactly one upload implementation regardless of
+// whether this is a brand-new recording or a queued retry.
 //
 // F7: checkin_id is non-null only when this recording is a reply to a
 // currently-displayed live check-in -- sent as its own form field
 // (spec section 3.2) so the backend routes the reply to that check-in
 // instead of resolving it by keyword/recency.
-static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, const char *checkin_id) {
+static bool upload_voice_note_from_file(const char *mono_pcm_path, uint32_t mono_bytes, const char *checkin_id) {
     const char *boundary = "----adhiVoiceBoundary7f3a";
 
     char checkin_part[192] = {0};
@@ -1871,8 +2081,7 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     char epilogue[64];
     int epilogue_len = snprintf(epilogue, sizeof(epilogue), "\r\n--%s--\r\n", boundary);
 
-    size_t mono_bytes = stereo_bytes / 2; // same bit depth, half the channels
-    wav_header_t wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, (uint32_t)mono_bytes);
+    wav_header_t wav_hdr = build_wav_header(PTT_SAMPLE_RATE_HZ, 1, 16, mono_bytes);
 
     size_t content_length = (size_t)checkin_part_len + (size_t)preamble_len + sizeof(wav_hdr) + mono_bytes + (size_t)epilogue_len;
 
@@ -1885,16 +2094,24 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     esp_http_client_config_t config = {};
     config.url = url;
     config.method = HTTP_METHOD_POST;
-    // 15s (the original guess) measured genuinely too short on real
-    // hardware: a 384KB mono upload took ~15.9s end to end (observed
-    // effective throughput ~25KB/s over wifi), so the client gave up
-    // waiting for the response right as the backend was finishing --
-    // the file had actually fully arrived and was processed correctly,
-    // this was purely a client-side false-negative timeout. 60s covers
-    // the worst case (the full 60s/1.92MB-mono recording cap) with
-    // headroom; may still need tuning once tested against that case.
-    config.timeout_ms = 60000;
+    // Sized from the payload rather than a flat constant -- see
+    // voice_upload_timeout_ms()'s comment for why a flat 60s (the original
+    // guess, itself already a bump from an even-too-short 15s once real
+    // hardware showed 384KB taking ~15.9s / ~25KB/s) still isn't enough
+    // once recordings can run several minutes long.
+    config.timeout_ms = voice_upload_timeout_ms(mono_bytes);
     config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    FILE *f = fopen(mono_pcm_path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "/voice: could not open %s for upload", mono_pcm_path);
+        return false;
+    }
+    if (fseek(f, sizeof(pending_voice_header_t), SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "/voice: failed to seek past header in %s", mono_pcm_path);
+        fclose(f);
+        return false;
+    }
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "auth", API_TOKEN);
@@ -1904,6 +2121,7 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "/voice: failed to open connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        fclose(f);
         return false;
     }
 
@@ -1914,35 +2132,34 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     write_ok = write_ok && esp_http_client_write(client, preamble, preamble_len) >= 0;
     write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(&wav_hdr), sizeof(wav_hdr)) >= 0;
 
-    // Stream the stereo->mono downmix in chunks rather than allocating a
-    // second full-size buffer for it. 4096 frames (8KB/write) cuts
-    // per-call overhead vs. a smaller chunk -- but that buffer must be
-    // heap/PSRAM-allocated, not a stack local: the main task stack is
-    // only 8192 bytes total (see the sync_snapshot_t comment elsewhere
-    // in this file), and an 8KB stack array alone nearly fills it,
-    // which crashed outright on real hardware (silent panic, no error
-    // logged first -- a stack overflow, unlike the SPI-reinit crash
-    // found earlier, which did log before aborting).
-    const int16_t *stereo_samples = reinterpret_cast<const int16_t *>(stereo_pcm);
-    size_t stereo_frame_count = stereo_bytes / (PTT_CHANNELS * sizeof(int16_t));
-    const size_t DOWNMIX_CHUNK_FRAMES = 4096;
-    auto *mono_chunk = static_cast<int16_t *>(heap_caps_malloc(DOWNMIX_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM));
-    if (!mono_chunk) {
-        ESP_LOGE(TAG, "/voice: failed to allocate downmix chunk buffer");
+    // Chunked read straight off SD -- must be heap/PSRAM-allocated, not a
+    // stack local: the main task stack is only 8192 bytes total, and an
+    // 8KB stack array alone nearly fills it, which crashed outright on
+    // real hardware (silent panic, no error logged first -- a stack
+    // overflow, unlike the SPI-reinit crash found earlier, which did log
+    // before aborting).
+    const size_t READ_CHUNK_BYTES = 8192;
+    auto *chunk = static_cast<uint8_t *>(heap_caps_malloc(READ_CHUNK_BYTES, MALLOC_CAP_SPIRAM));
+    if (!chunk) {
+        ESP_LOGE(TAG, "/voice: failed to allocate upload chunk buffer");
         esp_http_client_cleanup(client);
+        fclose(f);
         return false;
     }
 
-    for (size_t frame = 0; write_ok && frame < stereo_frame_count; frame += DOWNMIX_CHUNK_FRAMES) {
-        size_t this_chunk_frames = (frame + DOWNMIX_CHUNK_FRAMES <= stereo_frame_count) ? DOWNMIX_CHUNK_FRAMES : (stereo_frame_count - frame);
-        for (size_t i = 0; i < this_chunk_frames; i++) {
-            int16_t l = stereo_samples[(frame + i) * 2];
-            int16_t r = stereo_samples[(frame + i) * 2 + 1];
-            mono_chunk[i] = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+    uint32_t remaining = mono_bytes;
+    while (write_ok && remaining > 0) {
+        size_t want = remaining < READ_CHUNK_BYTES ? remaining : READ_CHUNK_BYTES;
+        size_t got = fread(chunk, 1, want, f);
+        if (got == 0) {
+            write_ok = false;
+            break;
         }
-        write_ok = write_ok && esp_http_client_write(client, reinterpret_cast<const char *>(mono_chunk), (int)(this_chunk_frames * sizeof(int16_t))) >= 0;
+        write_ok = esp_http_client_write(client, reinterpret_cast<const char *>(chunk), (int)got) >= 0;
+        remaining -= (uint32_t)got;
     }
-    heap_caps_free(mono_chunk);
+    heap_caps_free(chunk);
+    fclose(f);
 
     write_ok = write_ok && esp_http_client_write(client, epilogue, epilogue_len) >= 0;
 
@@ -1960,6 +2177,83 @@ static bool upload_voice_note(const uint8_t *stereo_pcm, size_t stereo_bytes, co
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return ok;
+}
+
+// Validates a queued file's header before trusting mono_bytes/checkin_id
+// from it. Rejects anything left behind by a power cut mid-recording or
+// mid-finalize (all-zero magic, or a size that doesn't match the header's
+// own accounting) -- this is data-integrity cleanup for corrupt entries,
+// not the age/attempt-count eviction that's deliberately out of scope for
+// this queue (see the queue's top-of-section comment).
+static bool pending_voice_read_valid_header(const char *path, pending_voice_header_t *out_hdr) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    bool ok = fread(out_hdr, sizeof(*out_hdr), 1, f) == 1;
+    if (ok && memcmp(out_hdr->magic, PENDING_VOICE_MAGIC, sizeof(out_hdr->magic)) != 0) {
+        ok = false;
+    }
+    if (ok) {
+        struct stat st;
+        ok = (fstat(fileno(f), &st) == 0) &&
+             ((uint64_t)st.st_size == sizeof(pending_voice_header_t) + (uint64_t)out_hdr->mono_bytes);
+    }
+    fclose(f);
+    return ok;
+}
+
+// Called once per normal wake, only after wifi is confirmed up (mirrors
+// flush_pending_device_error()'s call site/guard exactly). Retries queued
+// notes oldest-first, one upload attempt each, within a 5-minute
+// total-connected-time budget for this wake -- see expected_upload_ms()/
+// voice_upload_timeout_ms()'s comment for the full reasoning. The budget
+// check is a look-ahead (elapsed-so-far + this note's estimate), not a
+// plain "have we already blown the budget" check -- a plain check would
+// let a note start that can't possibly finish in time. The very first
+// note attempted this wake is never skipped by the look-ahead, so a
+// single oversized note at the front of the queue still gets its one
+// attempt rather than being blocked by its own size forever.
+static void flush_pending_voice_notes(void) {
+    if (!ensure_sdcard_mounted()) {
+        return;
+    }
+    uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
+    int count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
+    if (count == 0) {
+        return;
+    }
+
+    const int64_t FLUSH_BUDGET_MS = 5 * 60 * 1000;
+    int64_t elapsed_ms = 0;
+
+    for (int i = 0; i < count; i++) {
+        char path[64];
+        pending_voice_path_for_seq(seqs[i], path, sizeof(path));
+
+        pending_voice_header_t hdr;
+        if (!pending_voice_read_valid_header(path, &hdr)) {
+            ESP_LOGW(TAG, "voice queue: %s is corrupt/incomplete, discarding", path);
+            remove(path);
+            continue;
+        }
+
+        if (elapsed_ms > 0 && elapsed_ms + expected_upload_ms(hdr.mono_bytes) > FLUSH_BUDGET_MS) {
+            ESP_LOGI(TAG, "voice queue: flush budget spent, leaving %d note(s) for next wake", count - i);
+            break;
+        }
+
+        const char *checkin_id = hdr.checkin_id[0] != '\0' ? hdr.checkin_id : nullptr;
+        int64_t t0 = esp_timer_get_time();
+        bool ok = upload_voice_note_from_file(path, hdr.mono_bytes, checkin_id);
+        elapsed_ms += (esp_timer_get_time() - t0) / 1000;
+
+        if (ok) {
+            remove(path);
+        }
+        // else: leave in place -- exactly one attempt this wake, retried
+        // again on a later wake per the queue's no-expiry policy.
+    }
 }
 
 // F7: POST /device/checkin/{id}/skip -- no request body (spec section
@@ -2107,22 +2401,91 @@ static void run_push_to_talk_cycle(void) {
     // initialized" error before self-recovering).
     I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     Codec_StartInit();
-    if (have_live_checkin) {
-        eink_show_checkin_recording(s_last_screen.checkin_prompt);
-    } else {
-        eink_show_message("RECORDING... PRESS BOOT TO STOP");
-    }
 
-    const size_t max_bytes = (size_t)PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE * PTT_MAX_RECORD_MS / 1000;
-    auto *buf = static_cast<uint8_t *>(heap_caps_malloc(max_bytes, MALLOC_CAP_SPIRAM));
-    if (!buf) {
-        ESP_LOGE(TAG, "push-to-talk: failed to allocate %u byte recording buffer", (unsigned)max_bytes);
+    // The recording streams straight to a file under PENDING_VOICE_DIR from
+    // the moment capture starts, using the same on-disk format the retry
+    // queue uses -- there's no separate "save on failure" step; a failed
+    // upload just means this file, already correctly formatted, stays
+    // where flush_pending_voice_notes() will find it on a later wake.
+    bool have_pending_file = false;
+    char pending_path[64] = "";
+    uint32_t pending_mono_bytes = 0;
+
+    if (!ensure_sdcard_mounted()) {
+        ESP_LOGE(TAG, "push-to-talk: SD card unavailable, cannot record");
         eink_show_message("RECORDING FAILED");
     } else {
-        size_t recorded_bytes = record_until_stopped(buf, max_bytes);
-        double recorded_seconds = (double)recorded_bytes / (PTT_SAMPLE_RATE_HZ * PTT_CHANNELS * PTT_BYTES_PER_SAMPLE);
-        ESP_LOGI(TAG, "push-to-talk: recorded %u bytes (%.1fs)", (unsigned)recorded_bytes, recorded_seconds);
+        mkdir(PENDING_VOICE_DIR, 0755); // ignore EEXIST -- already-there is the common case
 
+        uint32_t min_seq, max_seq;
+        int count;
+        pending_voice_scan(&min_seq, &max_seq, &count);
+        if (count >= PENDING_VOICE_MAX_QUEUED) {
+            char evict_path[64];
+            pending_voice_path_for_seq(min_seq, evict_path, sizeof(evict_path));
+            remove(evict_path);
+        }
+        uint32_t new_seq = (count > 0) ? max_seq + 1 : 1;
+        pending_voice_path_for_seq(new_seq, pending_path, sizeof(pending_path));
+
+        FILE *f = fopen(pending_path, "wb");
+        if (!f) {
+            ESP_LOGE(TAG, "push-to-talk: failed to open %s for recording", pending_path);
+            eink_show_message("RECORDING FAILED");
+        } else {
+            pending_voice_header_t hdr = {};
+            // magic left all-zero until the recording finishes normally --
+            // see pending_voice_header_t's comment for why.
+            hdr.format_version = 1;
+            hdr.sample_rate = PTT_SAMPLE_RATE_HZ;
+            hdr.bits_per_sample = 16;
+            hdr.channels = 1;
+            hdr.mono_bytes = 0;
+            if (have_live_checkin) {
+                strncpy(hdr.checkin_id, s_last_screen.checkin_id, sizeof(hdr.checkin_id) - 1);
+                hdr.checkin_id[sizeof(hdr.checkin_id) - 1] = '\0';
+            }
+            bool header_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+
+            if (header_ok) {
+                if (have_live_checkin) {
+                    eink_show_checkin_recording(s_last_screen.checkin_prompt);
+                } else {
+                    eink_show_message("RECORDING... PRESS BOOT TO STOP");
+                }
+
+                size_t recorded_bytes = record_until_stopped(f);
+                double recorded_seconds = (double)recorded_bytes / (PTT_SAMPLE_RATE_HZ * PTT_BYTES_PER_SAMPLE);
+                ESP_LOGI(TAG, "push-to-talk: recorded %u mono bytes (%.1fs)", (unsigned)recorded_bytes, recorded_seconds);
+
+                if (recorded_bytes == 0) {
+                    fclose(f);
+                    remove(pending_path);
+                } else {
+                    // Finalize: patch magic + real byte count now that
+                    // they're known. A file left with all-zero magic (e.g.
+                    // power cut between here and the write completing) is
+                    // unambiguously incomplete to flush_pending_voice_notes().
+                    memcpy(hdr.magic, PENDING_VOICE_MAGIC, sizeof(hdr.magic));
+                    hdr.mono_bytes = (uint32_t)recorded_bytes;
+                    fseek(f, 0, SEEK_SET);
+                    bool finalize_ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+                    fclose(f);
+                    if (finalize_ok) {
+                        have_pending_file = true;
+                        pending_mono_bytes = (uint32_t)recorded_bytes;
+                    } else {
+                        remove(pending_path);
+                    }
+                }
+            } else {
+                fclose(f);
+                remove(pending_path);
+            }
+        }
+    }
+
+    if (have_pending_file) {
         // Immediate feedback that the stop (silence or button) actually
         // registered -- found via hardware testing that wifi connect +
         // upload can take 20s+, and staying on "RECORDING..." that whole
@@ -2135,12 +2498,16 @@ static void run_push_to_talk_cycle(void) {
             // F7: tag this reply to the live check-in, if one's showing,
             // so the backend routes it to that check-in instead of
             // resolving it by keyword/recency.
-            upload_ok = upload_voice_note(buf, recorded_bytes, have_live_checkin ? s_last_screen.checkin_id : nullptr);
+            upload_ok = upload_voice_note_from_file(pending_path, pending_mono_bytes,
+                                                     have_live_checkin ? s_last_screen.checkin_id : nullptr);
         } else {
             ESP_LOGE(TAG, "push-to-talk: skipping upload -- wifi never connected");
         }
-        eink_show_message(upload_ok ? "SENT" : "UPLOAD FAILED");
-        heap_caps_free(buf);
+
+        if (upload_ok) {
+            remove(pending_path);
+        }
+        eink_show_message(upload_ok ? "SENT" : "SAVED FOR RETRY");
 
         if (have_live_checkin) {
             // This reply resolves the check-in -- the persisted screen
@@ -2366,6 +2733,7 @@ extern "C" void app_main(void) {
     // No-op (and no wifi assumption needed) if nothing is pending.
     if (wifi_ok) {
         flush_pending_device_error(reset_reason, wake_reason, battery_mv, battery_pct);
+        flush_pending_voice_notes();
     }
 
     // F5: this cycle's actual wake-to-sync-response duration, measured
