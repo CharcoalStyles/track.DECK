@@ -83,7 +83,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.4.2-simplify-f6-f9"
+#define FIRMWARE_VERSION "0.4.3-port-bsp-deadcode"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;

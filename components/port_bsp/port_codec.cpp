@@ -11,10 +11,10 @@ static esp_codec_dev_handle_t playback = NULL;
 static esp_codec_dev_handle_t record = NULL;
 static bool i2s_initialized = false;
 
-esp_err_t Codec_Init(const char *strName) {
+static esp_err_t Codec_Init(void) {
   	if(i2s_initialized)
     return ESP_OK;
-    set_codec_board_type(strName);
+    set_codec_board_type("S3_ePaper_1_54");
   	codec_init_cfg_t codec_cfg = {};
 	codec_cfg.in_mode = CODEC_I2S_MODE_TDM;
 	codec_cfg.out_mode = CODEC_I2S_MODE_TDM;
@@ -27,18 +27,8 @@ esp_err_t Codec_Init(const char *strName) {
     return ESP_OK;
 }
 
-esp_codec_dev_handle_t Codec_SpeakerInit(void) {
-    ESP_ERROR_CHECK(Codec_Init("S3_ePaper_1_54"));
-  	return get_playback_handle();
-}
-
-esp_codec_dev_handle_t Codec_MicrophoneInit(void) {
-    ESP_ERROR_CHECK(Codec_Init("S3_ePaper_1_54"));
-    return get_record_handle();
-}
-
 void Codec_StartInit() {
-	Codec_Init("S3_ePaper_1_54");
+	Codec_Init();
 	esp_codec_dev_sample_info_t fs = {};
     fs.sample_rate = 16000;        
     fs.channel = 2;

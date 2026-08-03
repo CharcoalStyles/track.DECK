@@ -6,7 +6,6 @@
 extern "C" {
 #endif
 
-esp_err_t Codec_Init(const char *strName);
 void Codec_StartInit();
 
 esp_err_t Codec_PlaybackData(uint8_t *buffer,size_t bytes);
