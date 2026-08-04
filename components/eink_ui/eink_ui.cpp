@@ -186,6 +186,14 @@ static void format_local_hhmm(int64_t epoch, char *buf, size_t buf_len) {
     snprintf(buf, buf_len, "%02d:%02d", local_tm.tm_hour, local_tm.tm_min);
 }
 
+static bool is_same_local_day(int64_t epoch_a, int64_t epoch_b) {
+    time_t ta = (time_t)epoch_a, tb = (time_t)epoch_b;
+    struct tm tma, tmb;
+    localtime_r(&ta, &tma);
+    localtime_r(&tb, &tmb);
+    return tma.tm_year == tmb.tm_year && tma.tm_yday == tmb.tm_yday;
+}
+
 // F8: notice is non-null only when this cycle's sync failed -- drawn in
 // place of the plain divider line (same row, y=22) rather than adding a
 // new one, since a scale-1 text line (7px tall) fits in the same space
@@ -276,9 +284,13 @@ static void draw_checkin(const char *prompt_text) {
 // -- sync_snapshot_t is ~8.4KB, far more than the RTC slow memory budget).
 static next_item_t find_next_item(const sync_snapshot_t &snap) {
     next_item_t result = {};
+    time_t now = time(nullptr);
 
     if (snap.reminders_valid) {
         for (int i = 0; i < snap.reminders_count; i++) {
+            if (!is_same_local_day(snap.reminders[i].due_at, now)) {
+                continue;
+            }
             if (!result.have_next || snap.reminders[i].due_at < result.at) {
                 result.have_next = true;
                 result.at = snap.reminders[i].due_at;
@@ -290,6 +302,9 @@ static next_item_t find_next_item(const sync_snapshot_t &snap) {
     }
     if (snap.calendar_events_valid) {
         for (int i = 0; i < snap.calendar_events_count; i++) {
+            if (!is_same_local_day(snap.calendar_events[i].start, now)) {
+                continue;
+            }
             if (!result.have_next || snap.calendar_events[i].start < result.at) {
                 result.have_next = true;
                 result.at = snap.calendar_events[i].start;
