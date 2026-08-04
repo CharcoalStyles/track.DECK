@@ -24,6 +24,20 @@ int sync_effective_poll_interval(bool has_last_known_good, int last_known_good_s
     return has_last_known_good ? last_known_good_seconds : fallback_seconds;
 }
 
+int sync_failure_backoff_seconds(int base_interval_seconds, int consecutive_failures, int max_seconds) {
+    if (consecutive_failures <= 0) {
+        return base_interval_seconds;
+    }
+    int64_t interval = (int64_t)base_interval_seconds;
+    for (int i = 0; i < consecutive_failures && interval < max_seconds; i++) {
+        interval *= 2;
+    }
+    if (interval > max_seconds) {
+        interval = max_seconds;
+    }
+    return (int)interval;
+}
+
 int sync_effective_alarm_interval_seconds(int seconds_until_next_deadline,
                                            bool have_future_reminder,
                                            int64_t seconds_until_reminder,

@@ -33,6 +33,14 @@ uint32_t sync_backoff_delay_ms(const sync_backoff_t *b);
  * the last-known-good value if one exists, else a hardcoded fallback. */
 int sync_effective_poll_interval(bool has_last_known_good, int last_known_good_seconds, int fallback_seconds);
 
+/* Growing backoff on top of the normal poll interval after consecutive
+ * whole-cycle failures (wifi never connected, or /device/sync failed after
+ * its own retries) -- doubles base_interval_seconds per consecutive
+ * failure, capped at max_seconds, so a sustained outage doesn't keep
+ * retrying (and burning battery) at the normal healthy cadence forever.
+ * Returns base_interval_seconds unchanged when consecutive_failures <= 0. */
+int sync_failure_backoff_seconds(int base_interval_seconds, int consecutive_failures, int max_seconds);
+
 /* Floor on the scheduled alarm interval -- the RTC alarm write needs time
  * to actually take effect and the device still needs to get to sleep, so
  * the alarm is never scheduled for "now" or the past. */

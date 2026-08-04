@@ -105,3 +105,17 @@ TEST_CASE("alarm interval: out_is_reminder_wake is optional (nullptr doesn't cra
     int interval = sync_effective_alarm_interval_seconds(300, true, 60, SYNC_MIN_ALARM_INTERVAL_SECONDS, nullptr);
     REQUIRE(interval == 60);
 }
+
+TEST_CASE("failure backoff: zero consecutive failures returns base unchanged", "[sync_failure_backoff]") {
+    REQUIRE(sync_failure_backoff_seconds(300, 0, 1800) == 300);
+}
+
+TEST_CASE("failure backoff: doubles per consecutive failure", "[sync_failure_backoff]") {
+    REQUIRE(sync_failure_backoff_seconds(300, 1, 1800) == 600);
+    REQUIRE(sync_failure_backoff_seconds(300, 2, 1800) == 1200);
+}
+
+TEST_CASE("failure backoff: caps at max_seconds", "[sync_failure_backoff]") {
+    REQUIRE(sync_failure_backoff_seconds(300, 3, 1800) == 1800); // uncapped would be 2400
+    REQUIRE(sync_failure_backoff_seconds(300, 20, 1800) == 1800); // stays capped, no overflow
+}

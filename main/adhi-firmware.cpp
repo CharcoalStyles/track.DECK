@@ -79,12 +79,17 @@ static const char *TAG = "bringup";
 // connect timeout below instead of exhausting around 15-20s.
 #define WIFI_MAX_RETRY 10
 #define FALLBACK_POLL_INTERVAL_SECONDS 300
+// Cap on the growing backoff applied to the poll interval after consecutive
+// whole-cycle sync failures (see s_consecutive_full_sync_failures) -- keeps
+// a sustained outage checking back roughly this often instead of retrying
+// at the normal healthy cadence (or worse) indefinitely.
+#define MAX_SYNC_FAILURE_BACKOFF_SECONDS 1800
 
 // CLAUDE.md's "Firmware versioning" section: bump at least once before
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.4.5-eink-same-day-filter"
+#define FIRMWARE_VERSION "0.4.6-sync-retry-storm-fix"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -105,6 +110,11 @@ static int64_t s_boot_time_us;
 static RTC_DATA_ATTR char s_tz_posix[64] = "UTC0";
 static RTC_DATA_ATTR int s_last_known_good_poll_interval = FALLBACK_POLL_INTERVAL_SECONDS;
 static RTC_DATA_ATTR bool s_has_synced_ever = false;
+// Consecutive whole-cycle sync failures (wifi never connected, or
+// /device/sync failed after its own retries) -- reset to 0 on any
+// successful sync, otherwise drives sync_failure_backoff_seconds() so a
+// sustained outage backs off instead of retrying at the healthy cadence.
+static RTC_DATA_ATTR int s_consecutive_full_sync_failures = 0;
 // F5 (PROJECT_PLAN.md): spec section 4.1 wants time_awake_ms measured from
 // wake to the moment the /device/sync response is received -- which can't
 // be known *before* sending the very request that reports it. Per the
@@ -1355,7 +1365,10 @@ static void schedule_next_wake_and_sleep(pcf85063a_dev_t *rtc_dev) {
 
     int64_t seconds_until_sync = (s_next_full_sync_at > 0)
         ? (s_next_full_sync_at - now_epoch)
-        : sync_effective_poll_interval(s_has_synced_ever, s_last_known_good_poll_interval, FALLBACK_POLL_INTERVAL_SECONDS);
+        : sync_failure_backoff_seconds(
+              sync_effective_poll_interval(s_has_synced_ever, s_last_known_good_poll_interval, FALLBACK_POLL_INTERVAL_SECONDS),
+              s_consecutive_full_sync_failures,
+              MAX_SYNC_FAILURE_BACKOFF_SECONDS);
 
     bool is_reminder_wake = false;
     int interval = sync_effective_alarm_interval_seconds(
@@ -2295,6 +2308,7 @@ extern "C" void app_main(void) {
     // problem.
     sync_soonest_reminder_t soonest_reminder = {};
     bool reminder_activated = false;
+    s_consecutive_full_sync_failures = have_fresh_snapshot ? 0 : (s_consecutive_full_sync_failures + 1);
     if (have_fresh_snapshot) {
         // F9: computed (and, on a timer wake, acted on) *before* rendering
         // -- eink_render() needs to know whether a reminder just activated
@@ -2325,10 +2339,19 @@ extern "C" void app_main(void) {
     } else {
         ESP_LOGW(TAG, "sync failed this cycle -- showing last-known screen with a SYNC FAILED notice");
         eink_render_last_known(battery_pct, "SYNC FAILED");
-        // s_pending_reminders/s_next_full_sync_at deliberately left
-        // untouched on failure -- keep using the last known-good reminder
-        // timing rather than discarding it, matching this file's existing
-        // last-known-good pattern for s_last_known_good_poll_interval.
+        // s_pending_reminders deliberately left untouched on failure -- keep
+        // using the last known-good reminder timing rather than discarding
+        // it. s_next_full_sync_at is different: it's an *absolute* deadline
+        // (not a duration like s_last_known_good_poll_interval), so it was
+        // already ~now by the time this cycle woke up for it. Left
+        // untouched, every wake after a failure would compute
+        // seconds_until_sync ~= 0 and retry every
+        // SYNC_MIN_ALARM_INTERVAL_SECONDS (5s) forever instead of the
+        // intended poll interval -- this was observed in the field burning
+        // most of a day's battery. Reset it so schedule_next_wake_and_sleep
+        // falls through to sync_effective_poll_interval()'s last-known-good
+        // duration (plus backoff) instead.
+        s_next_full_sync_at = 0;
     }
     if (snap) {
         heap_caps_free(snap);
