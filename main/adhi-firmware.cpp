@@ -39,14 +39,12 @@
 #include "cJSON.h"
 
 #include "port_power.h"
-#include "port_display.h"
 #include "port_codec.h"
 #include "port_adc.h"
 #include "port_i2c.h"
 #include "port_shtc3.h"
 #include "port_sdcard.h"
 #include "epaper_config.h"
-#include "eink_lvgl.h"
 #include "eink_ui.h"
 
 #include "pcf85063a.h"
@@ -90,7 +88,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.5.4-lvgl-shutdown-simplify"
+#define FIRMWARE_VERSION "0.5.5-lvgl-componentize"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -1021,7 +1019,7 @@ static int pending_voice_list_sorted(uint32_t *out_seqs, int max_out) {
     return count;
 }
 
-// Bottom-right "N/15" indicator (scale 1), registered with eink_ui via
+// Bottom-right "N/15" indicator, registered with eink_ui via
 // eink_ui_set_pending_voice_indicator_cb() in app_main() -- it lives here
 // (not in eink_ui) because it needs ensure_sdcard_mounted()/
 // pending_voice_list_sorted(), voice-note-queue internals. Silent (draws
@@ -1033,13 +1031,7 @@ static void draw_pending_voice_indicator(void) {
     }
     uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
     int count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
-    if (count == 0) {
-        return;
-    }
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d/%d", count, PENDING_VOICE_MAX_QUEUED);
-    int w = (int)strlen(buf) * (FONT_GLYPH_W + 1);
-    draw_text(buf, EPD_WIDTH - w - 4, EPD_HEIGHT - FONT_GLYPH_H - 4, 1, DRIVER_COLOR_BLACK);
+    eink_ui_draw_pending_voice_badge(count, PENDING_VOICE_MAX_QUEUED);
 }
 
 // Two different numbers, deliberately not conflated: expected_upload_ms()
@@ -1890,11 +1882,7 @@ static void run_power_off_cycle(void) {
     // Two centered lines instead of a plain "SHUTTING DOWN" message --
     // e-ink is bistable, so this stays visible on screen after VBAT is
     // cut below, same as the normal message would.
-    eink_ensure_initialized();
-    EPD_Clear();
-    eink_lvgl_draw_shutdown_screen("Track", "Deck");
-    EPD_Display();
-    ESP_LOGI(TAG, "e-ink message shown: track/deck");
+    eink_show_shutdown_screen("Track", "Deck");
 
     vTaskDelay(pdMS_TO_TICKS(300));
 

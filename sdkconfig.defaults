@@ -63,16 +63,16 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
 # setting for their own SD card usage.
 CONFIG_FATFS_LFN_HEAP=y
 
-# LVGL v9 (components/eink_lvgl): Kconfig-driven config, no static
+# LVGL v9 (components/eink_ui): Kconfig-driven config, no static
 # lv_conf.h -- same approach as the board vendor's own LVGL v9 reference
 # example (10_LVGL_V9_Test). Color format is I1 (native 1bpp), matching
 # this panel's actual bit depth and port_display's own buffer layout,
 # unlike that reference example's wasteful 16bpp RGB565 buffer. LV_MEM_SIZE
 # kept small since only one small widget tree is ever alive at a time (see
-# eink_lvgl.cpp -- the LVGL display/widgets are scoped to a single render
+# ui_screens.cpp -- the LVGL display/widgets are scoped to a single render
 # call, not resident for the whole boot).
 #
-# Font: components/eink_lvgl/font_nokia_{16,8}.c, custom-generated (via
+# Font: components/eink_ui/font_nokia_{16,8}.c, custom-generated (via
 # `npx lv_font_conv`, see font_nokia.h's header comment for the exact
 # command) from ~/Downloads/nokiafc22.ttf ("Nokia Cellphone FC") at --bpp 1
 # (true monochrome, no AA baked in). Not Montserrat -- confirmed on

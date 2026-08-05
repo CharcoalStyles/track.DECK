@@ -4,22 +4,7 @@
 #include <cstdint>
 
 #include "sync_snapshot.h"
-
-#define FONT_GLYPH_W 5
-#define FONT_GLYPH_H 7
-
-// Draws a single line of text (uppercase A-Z + digits + bounded
-// punctuation, see eink_ui.cpp's font comment), returns the total pixel
-// width drawn.
-int draw_text(const char *s, int x0, int y0, int scale, uint8_t color);
-
-// Soonest upcoming reminder or calendar event, whichever is sooner.
-struct next_item_t {
-    bool have_next;
-    bool is_event;
-    int64_t at;
-    char label[SYNC_STR_TEXT_LEN];
-};
+#include "ui_state.h"
 
 // Persisted summary of the last real sync render, survives deep sleep --
 // lets eink_render_last_known() redraw the same screen without a fresh
@@ -65,5 +50,16 @@ void eink_show_message(const char *message);
 // Same layout as a live check-in, but with a "REPLYING..." header --
 // used while recording a voice reply to a check-in.
 void eink_show_checkin_recording(const char *prompt_text);
+
+// PWR-hold shutdown screen: two centered lines (e.g. "Track"/"Deck").
+// Owns EPD_Clear/EPD_Display itself, same as every entry point above.
+void eink_show_shutdown_screen(const char *line1, const char *line2);
+
+// Bottom-right "N/max" pending-voice-note badge, drawn as an overlay on
+// top of whatever screen is currently on the panel. Draws nothing when
+// count <= 0. Called from main/adhi-firmware.cpp's own pending-voice
+// indicator callback (registered via eink_ui_set_pending_voice_indicator_cb()
+// above), which owns the SD-card queue scan this needs a count from.
+void eink_ui_draw_pending_voice_badge(int count, int max_count);
 
 #endif // EINK_UI_H
