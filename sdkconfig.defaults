@@ -62,3 +62,43 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
 # mounted fine. The original Waveshare reference examples enable this same
 # setting for their own SD card usage.
 CONFIG_FATFS_LFN_HEAP=y
+
+# LVGL v9 (components/eink_lvgl): Kconfig-driven config, no static
+# lv_conf.h -- same approach as the board vendor's own LVGL v9 reference
+# example (10_LVGL_V9_Test). Color format is I1 (native 1bpp), matching
+# this panel's actual bit depth and port_display's own buffer layout,
+# unlike that reference example's wasteful 16bpp RGB565 buffer. LV_MEM_SIZE
+# kept small since only one small widget tree is ever alive at a time (see
+# eink_lvgl.cpp -- the LVGL display/widgets are scoped to a single render
+# call, not resident for the whole boot).
+#
+# Font: components/eink_lvgl/font_nokia_{16,8}.c, custom-generated (via
+# `npx lv_font_conv`, see font_nokia.h's header comment for the exact
+# command) from ~/Downloads/nokiafc22.ttf ("Nokia Cellphone FC") at --bpp 1
+# (true monochrome, no AA baked in). Not Montserrat -- confirmed on
+# hardware that Montserrat's grayscale-AA-then-1bit-threshold rendering
+# produces inconsistent stroke weight/artifacts on this strictly-binary
+# e-ink panel. Not Unscii either -- also bpp1/artifact-free, but read as
+# too "chunky" on hardware for this device's small screen. LVGL still
+# needs *a* CONFIG_LV_FONT_DEFAULT_* selected internally (there's no
+# "default to a custom font" Kconfig option) even though none of this
+# component's own labels use it (both always set an explicit style font)
+# -- picked Unscii-8 over Montserrat here too, so no anti-aliased font
+# ends up in the binary at all, not even unused.
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_COLOR_DEPTH_1=y
+CONFIG_LV_DRAW_SW_SUPPORT_I1=y
+CONFIG_LV_DRAW_SW_I1_LUM_THRESHOLD=127
+CONFIG_LV_MEM_SIZE_KILOBYTES=32
+CONFIG_LV_FONT_UNSCII_8=y
+CONFIG_LV_FONT_DEFAULT_UNSCII_8=y
+CONFIG_LV_USE_FREETYPE=n
+CONFIG_LV_USE_QRCODE=n
+CONFIG_LV_USE_BARCODE=n
+CONFIG_LV_USE_SNAPSHOT=n
+CONFIG_LV_USE_IMGFONT=n
+# LV_BUILD_EXAMPLES/DEMOS default to y and pull in LVGL's own example/demo
+# assets (image decoders for PNG/WebP/SVG/TTF/rlottie, widget demos, etc)
+# -- none of that is used here, just adds flash weight.
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_BUILD_DEMOS=n

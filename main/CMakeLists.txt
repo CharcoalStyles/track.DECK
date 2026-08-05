@@ -4,6 +4,7 @@ idf_component_register(SRCS "adhi-firmware.cpp"
                     port_bsp
                     sync_proto
                     eink_ui
+                    eink_lvgl
                     waveshare__pcf85063a
                     my_button
                     json

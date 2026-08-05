@@ -46,6 +46,7 @@
 #include "port_shtc3.h"
 #include "port_sdcard.h"
 #include "epaper_config.h"
+#include "eink_lvgl.h"
 #include "eink_ui.h"
 
 #include "pcf85063a.h"
@@ -89,7 +90,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.4.6-sync-retry-storm-fix"
+#define FIRMWARE_VERSION "0.5.4-lvgl-shutdown-simplify"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -740,6 +741,45 @@ static void rotate_debug_log_if_needed(void) {
         remove(SDlist "/debug.log.old");
         rename(SDlist "/debug.log", SDlist "/debug.log.old");
     }
+}
+
+// Debugging aid: the whole reason debug.log exists is that a boot cycle
+// can sleep again before there's time to notice and open a serial
+// monitor -- but plugging in over the same "flashing mode" USB port and
+// watching the console still doesn't show anything from *before* that
+// connection, only new lines. Echoes the tail of the previous debug.log
+// straight to the console the moment the SD card mounts, so whatever's
+// already on the card (last cycle's failures included) is visible
+// immediately without pulling the card. Bounded to the last few KB (not
+// the whole up-to-256KB file) so it can't itself add more than a
+// fraction of a second of UART time to boot -- called before NVS init
+// and well before the button-hold-timing-sensitive push-to-talk path
+// below, so it doesn't risk that timing either. Reads via plain
+// fread/fwrite (not ESP_LOG) to avoid recursing back into
+// sd_log_vprintf().
+#define DEBUG_LOG_CONSOLE_TAIL_BYTES (4 * 1024)
+
+static void echo_debug_log_tail_to_console(void) {
+    if (!ensure_sdcard_mounted()) {
+        return;
+    }
+    FILE *f = fopen(SDlist "/debug.log", "r");
+    if (!f) {
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    long start = size > DEBUG_LOG_CONSOLE_TAIL_BYTES ? size - DEBUG_LOG_CONSOLE_TAIL_BYTES : 0;
+    fseek(f, start, SEEK_SET);
+
+    printf("\n----- debug.log tail (%s) -----\n", start > 0 ? "truncated, see /sdcard/debug.log for full history" : "full");
+    char buf[256];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        fwrite(buf, 1, n, stdout);
+    }
+    printf("----- end debug.log tail -----\n\n");
+    fclose(f);
 }
 
 // Debugging aid: this board's native USB-Serial/JTAG only stays up while
@@ -1852,15 +1892,7 @@ static void run_power_off_cycle(void) {
     // cut below, same as the normal message would.
     eink_ensure_initialized();
     EPD_Clear();
-    const int scale = 3;
-    const char *line1 = "TRACK";
-    const char *line2 = "DECK";
-    int w1 = (int)strlen(line1) * (FONT_GLYPH_W + 1) * scale;
-    int w2 = (int)strlen(line2) * (FONT_GLYPH_W + 1) * scale;
-    int line_h = (FONT_GLYPH_H + 4) * scale;
-    int y0 = (EPD_HEIGHT - line_h * 2) / 2;
-    draw_text(line1, (EPD_WIDTH - w1) / 2, y0, scale, DRIVER_COLOR_BLACK);
-    draw_text(line2, (EPD_WIDTH - w2) / 2, y0 + line_h, scale, DRIVER_COLOR_BLACK);
+    eink_lvgl_draw_shutdown_screen("Track", "Deck");
     EPD_Display();
     ESP_LOGI(TAG, "e-ink message shown: track/deck");
 
@@ -2124,6 +2156,7 @@ extern "C" void app_main(void) {
     // output only, skipping the SD mount/write cost per log line entirely.
 #if SD_DEBUG_LOG_ENABLED
     esp_log_set_vprintf(sd_log_vprintf);
+    echo_debug_log_tail_to_console();
 #endif
 
     // NVS init, per standard ESP-IDF convention -- required before wifi,

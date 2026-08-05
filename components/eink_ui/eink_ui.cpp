@@ -9,6 +9,7 @@
 
 #include "port_display.h"
 #include "epaper_config.h"
+#include "eink_lvgl.h"
 
 static const char *TAG = "eink_ui";
 
@@ -429,7 +430,7 @@ void eink_render(const sync_snapshot_t &snap, int battery_pct, const sync_soones
             // edge (draw_checkin()'s own comment on its 14-line cap).
             render_kind = "check-in";
         } else {
-            draw_dashboard(next);
+            eink_lvgl_draw_dashboard(next.have_next, next.is_event, next.at, next.label);
             draw_pending_voice_indicator();
             render_kind = "dashboard";
         }
@@ -472,7 +473,8 @@ void eink_render_last_known(int battery_pct, const char *notice) {
         if (s_last_screen.is_checkin) {
             draw_checkin(s_last_screen.checkin_prompt);
         } else {
-            draw_dashboard(s_last_screen.next);
+            eink_lvgl_draw_dashboard(s_last_screen.next.have_next, s_last_screen.next.is_event,
+                                      s_last_screen.next.at, s_last_screen.next.label);
             draw_pending_voice_indicator();
         }
     } else {
