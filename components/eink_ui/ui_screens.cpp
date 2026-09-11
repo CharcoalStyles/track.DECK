@@ -22,10 +22,16 @@
 // at y=48 plus a small gap.
 #define CONTENT_Y 54
 
-// Pending-voice badge canvas: a thin strip along the bottom edge, full
-// panel width so the label's own right-alignment lines up with panel
-// coordinates (render_lvgl_canvas only offsets y, not x).
-#define BADGE_H 16
+// Footer canvas: a thin strip along the bottom edge, full panel width so
+// the labels' own left/right-alignment lines up with panel coordinates
+// (render_lvgl_canvas only offsets y, not x). Carries the pending-voice
+// "N/max" badge (bottom-right) and, when a sync failed this cycle, the
+// "SYNC FAILED"-style notice (bottom-left) -- see ui_screens_render_footer().
+#define FOOTER_H 16
+// Main-canvas content (next-up / check-in / remaining-items) must stop
+// above this line so it never gets drawn over by the footer canvas, which
+// is flushed to the panel afterwards and repaints its whole strip.
+#define FOOTER_Y (PANEL_H - FOOTER_H)
 
 static bool s_lvgl_core_initialized = false;
 static int s_flush_stride = 0;
@@ -120,12 +126,13 @@ static void draw_divider(lv_obj_t *screen, int y) {
 }
 
 // F4 (PROJECT_PLAN.md): time (top-left), battery% (top-right), temp
-// (top-center) if weather is available, then either a notice line (F8:
-// "SYNC FAILED") or a plain divider, then (if weather is available) a
-// cloud+rain row and a sunrise/sunset row, then a closing divider. Shared
-// by every screen that has a status bar at all (dashboard, check-in,
-// reminder-override) -- message/recording/shutdown screens skip it
-// entirely, matching their original hand-rolled behavior.
+// (top-center) if weather is available, then a divider, then (if weather is
+// available) a cloud+rain row and a sunrise/sunset row, then a closing
+// divider. Shared by every screen that has a status bar at all (dashboard,
+// check-in, reminder-override) -- message/recording/shutdown screens skip
+// it entirely, matching their original hand-rolled behavior. F8's "SYNC
+// FAILED" notice lives in the footer now (ui_screens_render_footer()), not
+// here -- it used to sit at y=22 in an awkward spot mid-status-bar.
 static void ui_status_bar_build(lv_obj_t *screen, const device_ui_state_t &s) {
     char battery_buf[8];
     snprintf(battery_buf, sizeof(battery_buf), "%d%%", s.battery_pct);
@@ -153,14 +160,7 @@ static void ui_status_bar_build(lv_obj_t *screen, const device_ui_state_t &s) {
         lv_obj_align(temp, LV_ALIGN_TOP_MID, 0, 4);
     }
 
-    if (s.notice) {
-        lv_obj_t *notice = lv_label_create(screen);
-        lv_obj_set_style_text_font(notice, &font_nokia_8, 0);
-        lv_label_set_text(notice, s.notice);
-        lv_obj_set_pos(notice, 8, 22);
-    } else {
-        draw_divider(screen, 22);
-    }
+    draw_divider(screen, 22);
 
     if (s.has_weather) {
         char cloud_buf[24];
@@ -185,9 +185,22 @@ static void ui_status_bar_build(lv_obj_t *screen, const device_ui_state_t &s) {
     draw_divider(screen, 48);
 }
 
-static void ui_dashboard_content_build(lv_obj_t *screen, const next_item_t &next) {
+// Row pitch for the remaining-items list below -- font_nokia_8's line_height
+// (8px) plus a small gap, tuned to fit "as many as fit" per the design brief
+// rather than a fixed count.
+#define REMAINING_ROW_H 10
+#define NEXT_BODY_Y (CONTENT_Y + 18)
+#define NEXT_BODY_H 16 // 2 lines of font_nokia_8
+#define DIVIDER_Y (NEXT_BODY_Y + NEXT_BODY_H + 2)
+#define LOWER_Y (DIVIDER_Y + 6)
+
+// "Next up" header + body, always drawn first in the content area. Body is
+// now height-capped (LV_LABEL_LONG_MODE_DOTS) instead of the old unbounded
+// WRAP, since the check-in/remaining-items section below it needs the rest
+// of the panel.
+static void ui_next_up_build(lv_obj_t *screen, const next_item_t &next) {
     if (!next.have_next) {
-        return; // blank content area
+        return; // blank -- divider below still gets drawn by the caller
     }
 
     char time_buf[6];
@@ -206,10 +219,11 @@ static void ui_dashboard_content_build(lv_obj_t *screen, const next_item_t &next
 
     lv_obj_t *body = lv_label_create(screen);
     lv_obj_set_style_text_font(body, &font_nokia_8, 0);
-    lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(body, PANEL_W - 16);
+    lv_obj_set_height(body, NEXT_BODY_H);
     lv_label_set_text(body, next.label);
-    lv_obj_set_pos(body, 8, CONTENT_Y + 22);
+    lv_obj_set_pos(body, 8, NEXT_BODY_Y);
 }
 
 // header_text is "CHECK-IN" for a live check-in, "REPLYING..." while
@@ -218,48 +232,60 @@ static void ui_dashboard_content_build(lv_obj_t *screen, const next_item_t &next
 // LV_LABEL_LONG_MODE_DOTS (wrap + trailing "..." once the fixed
 // width/height fills up) instead of a hand-rolled word-wrapper -- LVGL
 // already does this natively.
-static void ui_checkin_content_build(lv_obj_t *screen, const char *prompt, const char *header_text) {
+static void ui_checkin_lower_build(lv_obj_t *screen, const char *prompt, const char *header_text) {
     lv_obj_t *header = lv_label_create(screen);
     lv_obj_set_style_text_font(header, &font_nokia_16, 0);
     lv_label_set_text(header, header_text);
-    lv_obj_set_pos(header, 8, CONTENT_Y);
+    lv_obj_set_pos(header, 8, LOWER_Y);
 
     lv_obj_t *body = lv_label_create(screen);
     lv_obj_set_style_text_font(body, &font_nokia_8, 0);
     lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(body, PANEL_W - 16);
-    lv_obj_set_height(body, PANEL_H - CONTENT_Y - 20 - 4);
+    lv_obj_set_height(body, FOOTER_Y - LOWER_Y - 18);
     lv_label_set_text(body, prompt);
-    lv_obj_set_pos(body, 8, CONTENT_Y + 20);
+    lv_obj_set_pos(body, 8, LOWER_Y + 18);
+}
+
+// Today's remaining reminders/events, one "HH:MM: label" row each, as many
+// as fit top-to-bottom (stopping above the footer strip, not the raw panel
+// bottom) -- no lv_list/scroller involved, this codebase has no list widget
+// anywhere and a handful of absolute-positioned labels is simpler than
+// adding one for a max-15-row static display.
+static void ui_remaining_lower_build(lv_obj_t *screen, const remaining_items_t &remaining) {
+    int y = LOWER_Y;
+    for (int i = 0; i < remaining.count && y + 8 <= FOOTER_Y; i++) {
+        char time_buf[6];
+        format_local_hhmm(remaining.items[i].at, time_buf, sizeof(time_buf));
+        char line[8 + UI_REMAINING_LABEL_LEN];
+        snprintf(line, sizeof(line), "%s: %s", time_buf, remaining.items[i].label);
+
+        lv_obj_t *row = lv_label_create(screen);
+        lv_obj_set_style_text_font(row, &font_nokia_8, 0);
+        lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(row, PANEL_W - 16);
+        lv_obj_set_height(row, 8);
+        lv_label_set_text(row, line);
+        lv_obj_set_pos(row, 8, y);
+
+        y += REMAINING_ROW_H;
+    }
 }
 
 static void build_dashboard_screen(lv_obj_t *screen, void *ctx_ptr) {
     const device_ui_state_t *s = (const device_ui_state_t *)ctx_ptr;
     ui_status_bar_build(screen, *s);
-    ui_dashboard_content_build(screen, s->next);
+    ui_next_up_build(screen, s->next);
+    draw_divider(screen, DIVIDER_Y);
+    if (s->checkin_prompt) {
+        ui_checkin_lower_build(screen, s->checkin_prompt, s->checkin_replying ? "REPLYING..." : "CHECK-IN");
+    } else {
+        ui_remaining_lower_build(screen, s->remaining);
+    }
 }
 
 void ui_screens_render_dashboard(const device_ui_state_t &state) {
     render_lvgl_canvas(PANEL_W, PANEL_H, 0, build_dashboard_screen, (void *)&state);
-}
-
-static void build_checkin_screen(lv_obj_t *screen, void *ctx_ptr) {
-    const device_ui_state_t *s = (const device_ui_state_t *)ctx_ptr;
-    ui_status_bar_build(screen, *s);
-    ui_checkin_content_build(screen, s->checkin_prompt, "CHECK-IN");
-}
-
-void ui_screens_render_checkin(const device_ui_state_t &state) {
-    render_lvgl_canvas(PANEL_W, PANEL_H, 0, build_checkin_screen, (void *)&state);
-}
-
-static void build_recording_screen(lv_obj_t *screen, void *ctx_ptr) {
-    const char *prompt = (const char *)ctx_ptr;
-    ui_checkin_content_build(screen, prompt, "REPLYING...");
-}
-
-void ui_screens_render_recording(const char *prompt_text) {
-    render_lvgl_canvas(PANEL_W, PANEL_H, 0, build_recording_screen, (void *)prompt_text);
 }
 
 static void build_message_screen(lv_obj_t *screen, void *ctx_ptr) {
@@ -327,19 +353,44 @@ void ui_screens_render_shutdown(const char *line1, const char *line2) {
     render_lvgl_canvas(PANEL_W, PANEL_H, 0, build_stacked_lines_screen, &ctx);
 }
 
-static void build_pending_voice_badge(lv_obj_t *screen, void *ctx_ptr) {
-    const char *text = (const char *)ctx_ptr;
-    lv_obj_t *label = lv_label_create(screen);
-    lv_obj_set_style_text_font(label, &font_nokia_8, 0);
-    lv_label_set_text(label, text);
-    lv_obj_align(label, LV_ALIGN_TOP_RIGHT, -4, 4);
+struct footer_ctx_t {
+    const char *badge_text; // "N/max", or nullptr when the queue is empty
+    const char *notice;     // e.g. "SYNC FAILED", or nullptr
+};
+
+static void build_footer(lv_obj_t *screen, void *ctx_ptr) {
+    const footer_ctx_t *ctx = (const footer_ctx_t *)ctx_ptr;
+    if (ctx->notice) {
+        lv_obj_t *notice = lv_label_create(screen);
+        lv_obj_set_style_text_font(notice, &font_nokia_8, 0);
+        lv_label_set_text(notice, ctx->notice);
+        lv_obj_align(notice, LV_ALIGN_TOP_LEFT, 4, 4);
+    }
+    if (ctx->badge_text) {
+        lv_obj_t *badge = lv_label_create(screen);
+        lv_obj_set_style_text_font(badge, &font_nokia_8, 0);
+        lv_label_set_text(badge, ctx->badge_text);
+        lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, -4, 4);
+    }
 }
 
-void ui_screens_render_pending_voice_badge(int count, int max_count) {
-    if (count <= 0) {
-        return; // silent when the queue is empty, matching the original indicator
+// Bottom strip, drawn as a second canvas over whatever the main dashboard
+// canvas just rendered -- both the pending-voice "N/max" badge (bottom-right)
+// and F8's "SYNC FAILED"-style notice (bottom-left) live here together in
+// one pass, since this canvas repaints its whole strip on flush (a second,
+// separate draw here would erase the first). Draws nothing at all when
+// both are absent, matching the badge's original silent-when-empty
+// behavior.
+void ui_screens_render_footer(int count, int max_count, const char *notice) {
+    if (count <= 0 && !notice) {
+        return;
     }
-    char text[16];
-    snprintf(text, sizeof(text), "%d/%d", count, max_count);
-    render_lvgl_canvas(PANEL_W, BADGE_H, PANEL_H - BADGE_H, build_pending_voice_badge, (void *)text);
+    char badge_buf[16];
+    footer_ctx_t ctx = {};
+    if (count > 0) {
+        snprintf(badge_buf, sizeof(badge_buf), "%d/%d", count, max_count);
+        ctx.badge_text = badge_buf;
+    }
+    ctx.notice = notice;
+    render_lvgl_canvas(PANEL_W, FOOTER_H, FOOTER_Y, build_footer, (void *)&ctx);
 }

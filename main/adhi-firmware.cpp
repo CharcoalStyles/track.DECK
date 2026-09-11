@@ -33,6 +33,7 @@
 #include <esp_wifi.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <mbedtls/sha256.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 
@@ -88,7 +89,7 @@ static const char *TAG = "bringup";
 // every commit that changes main/ or components/ source, in the same
 // commit as the change itself -- this is the single point of truth for
 // both /device/sync and /device/error, so bumping here covers both.
-#define FIRMWARE_VERSION "0.5.5-lvgl-componentize"
+#define FIRMWARE_VERSION "0.6.0-alert-sounds"
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count = 0;
@@ -586,6 +587,7 @@ static void log_snapshot(const sync_snapshot_t &snap) {
     ESP_LOGI(TAG, "snapshot.checkins: valid=%d count=%d", snap.checkins_valid, snap.checkins_count);
     ESP_LOGI(TAG, "snapshot.reminders: valid=%d count=%d", snap.reminders_valid, snap.reminders_count);
     ESP_LOGI(TAG, "snapshot.calendar_events: valid=%d count=%d", snap.calendar_events_valid, snap.calendar_events_count);
+    ESP_LOGI(TAG, "snapshot.alert_sounds: valid=%d count=%d", snap.alert_sounds_valid, snap.alert_sounds_count);
     if (snap.has_weather) {
         ESP_LOGI(TAG, "snapshot.weather: temp=%.1fC cloud=%d%% sunrise=%lld sunset=%lld",
                  snap.weather.temperature_c, snap.weather.cloud_cover_pct,
@@ -654,6 +656,8 @@ typedef struct {
     char id[SYNC_STR_ID_LEN];
     char message[SYNC_STR_TEXT_LEN];
     int64_t due_at;
+    char alert_sound_id[SYNC_STR_ID_LEN]; // empty = unpinned
+    int alert_sound_volume;               // meaningful only when alert_sound_id[0] != '\0'
 } reminder_wake_entry_t;
 static RTC_DATA_ATTR reminder_wake_entry_t s_pending_reminders[SYNC_MAX_REMINDERS];
 static RTC_DATA_ATTR int s_pending_reminders_count = 0;
@@ -1019,19 +1023,21 @@ static int pending_voice_list_sorted(uint32_t *out_seqs, int max_out) {
     return count;
 }
 
-// Bottom-right "N/15" indicator, registered with eink_ui via
-// eink_ui_set_pending_voice_indicator_cb() in app_main() -- it lives here
-// (not in eink_ui) because it needs ensure_sdcard_mounted()/
-// pending_voice_list_sorted(), voice-note-queue internals. Silent (draws
-// nothing) when the queue is empty, so the normal screen is untouched on
-// the common case of every recording having uploaded fine.
-static void draw_pending_voice_indicator(void) {
-    if (!ensure_sdcard_mounted()) {
-        return;
+// Footer strip, registered with eink_ui via
+// eink_ui_set_pending_voice_indicator_cb() in app_main() -- the "N/15"
+// count lives here (not in eink_ui) because it needs
+// ensure_sdcard_mounted()/pending_voice_list_sorted(), voice-note-queue
+// internals; notice is just forwarded through from the caller (only
+// eink_render_last_known() ever passes one). Count stays 0 (badge omitted)
+// if the SD card isn't mounted -- notice must still get drawn in that case,
+// so this no longer bails out early the way the count-only version did.
+static void draw_pending_voice_indicator(const char *notice) {
+    int count = 0;
+    if (ensure_sdcard_mounted()) {
+        uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
+        count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
     }
-    uint32_t seqs[PENDING_VOICE_MAX_QUEUED];
-    int count = pending_voice_list_sorted(seqs, PENDING_VOICE_MAX_QUEUED);
-    eink_ui_draw_pending_voice_badge(count, PENDING_VOICE_MAX_QUEUED);
+    eink_ui_draw_pending_voice_badge(count, PENDING_VOICE_MAX_QUEUED, notice);
 }
 
 // Two different numbers, deliberately not conflated: expected_upload_ms()
@@ -1063,6 +1069,13 @@ static int voice_upload_timeout_ms(uint32_t mono_bytes) {
 // ---------------------------------------------------------------------
 
 #define CHIME_DIR SDlist "/notesnd"
+// Backend-synced alert sound library (separate from CHIME_DIR, which
+// stays a purely user-managed manual folder, untouched by sync). See
+// reconcile_alert_sound_library() below for how this directory gets
+// populated/pruned, and play_reminder_chime() for the fallback chain
+// that uses it.
+#define ALERT_SOUND_DIR SDlist "/alert_sounds"
+#define ALERT_SOUND_MANIFEST_PATH ALERT_SOUND_DIR "/manifest.txt"
 #define CHIME_SAMPLE_RATE_HZ 16000 // must match Codec_StartInit()'s opened format
 #define CHIME_CHANNELS 2           // codec is opened fixed-stereo regardless of source
 #define CHIME_BYTES_PER_SAMPLE 2
@@ -1135,6 +1148,105 @@ static bool find_random_wav_in_notesnd(char *out_path, size_t out_path_len) {
         i++;
     }
     closedir(dir);
+    return found;
+}
+
+// Tracks what's currently cached under ALERT_SOUND_DIR: id, sha256 (a
+// diff-cache optimization for reconcile_alert_sound_library(), avoids
+// re-hashing local files every cycle), and volume (load-bearing --
+// lets playback read each sound's loudness straight off SD with no live
+// snapshot needed, so it works identically on a network-free F9
+// reminder-only wake). A torn write on power loss just costs a
+// redundant re-fetch/re-verify next cycle (the .wav payloads are
+// independently sha256-verified), so this is a plain overwrite, no
+// temp-file+rename needed here (unlike the .wav payloads themselves).
+struct alert_sound_manifest_entry_t {
+    char id[SYNC_STR_ID_LEN];
+    char sha256[SYNC_STR_SHA256_LEN];
+    int volume;
+};
+
+// Missing file (never synced yet) is just zero entries, not an error.
+// Any malformed line is skipped rather than aborting the whole load.
+static int load_alert_sound_manifest(alert_sound_manifest_entry_t *out, int max_entries) {
+    FILE *f = fopen(ALERT_SOUND_MANIFEST_PATH, "r");
+    if (!f) {
+        return 0;
+    }
+    int count = 0;
+    char id[SYNC_STR_ID_LEN];
+    char sha256[SYNC_STR_SHA256_LEN];
+    int volume;
+    while (count < max_entries && fscanf(f, "%39s %64s %d", id, sha256, &volume) == 3) {
+        strncpy(out[count].id, id, sizeof(out[count].id) - 1);
+        out[count].id[sizeof(out[count].id) - 1] = '\0';
+        strncpy(out[count].sha256, sha256, sizeof(out[count].sha256) - 1);
+        out[count].sha256[sizeof(out[count].sha256) - 1] = '\0';
+        out[count].volume = volume;
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+static void write_alert_sound_manifest(const alert_sound_manifest_entry_t *entries, int count) {
+    FILE *f = fopen(ALERT_SOUND_MANIFEST_PATH, "w");
+    if (!f) {
+        ESP_LOGW(TAG, "alert sound sync: failed to write manifest");
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "%s %s %d\n", entries[i].id, entries[i].sha256, entries[i].volume);
+    }
+    fclose(f);
+}
+
+// Mirrors find_random_wav_in_notesnd()'s uniform-random approach, but
+// candidates come from the manifest (so each carries its own volume)
+// rather than a directory scan. Skips any manifest entry whose <id>.wav
+// doesn't actually exist on disk -- defensive, covers a manifest/
+// filesystem desync (e.g. a partial prune) rather than trusting the
+// manifest blindly. False (falls through to notesnd/tone) if nothing on
+// the manifest currently has a backing file -- expected pre-first-sync,
+// not an error.
+static bool find_random_synced_alert_sound(char *out_path, size_t out_path_len, int *out_volume) {
+    // Heap/PSRAM, not stack locals -- the main task stack is only 8192
+    // bytes total (CONFIG_ESP_MAIN_TASK_STACK_SIZE), and this function is
+    // called from deep within app_main's own call chain (via
+    // handle_due_reminder() -> play_reminder_chime()), same tight-stack
+    // risk zone that stream_voice_multipart_body()'s chunk buffer already
+    // had to work around elsewhere in this file.
+    auto *entries = static_cast<alert_sound_manifest_entry_t *>(
+        heap_caps_malloc(sizeof(alert_sound_manifest_entry_t) * SYNC_MAX_ALERT_SOUNDS, MALLOC_CAP_SPIRAM));
+    auto *candidates = static_cast<int *>(heap_caps_malloc(sizeof(int) * SYNC_MAX_ALERT_SOUNDS, MALLOC_CAP_SPIRAM));
+    if (!entries || !candidates) {
+        heap_caps_free(entries);
+        heap_caps_free(candidates);
+        return false;
+    }
+
+    int count = load_alert_sound_manifest(entries, SYNC_MAX_ALERT_SOUNDS);
+    int candidate_count = 0;
+    for (int i = 0; i < count; i++) {
+        char path[96];
+        snprintf(path, sizeof(path), "%s/%s.wav", ALERT_SOUND_DIR, entries[i].id);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fclose(f);
+            candidates[candidate_count++] = i;
+        }
+    }
+
+    bool found = false;
+    if (candidate_count > 0) {
+        int pick = candidates[esp_random() % (uint32_t)candidate_count];
+        snprintf(out_path, out_path_len, "%s/%s.wav", ALERT_SOUND_DIR, entries[pick].id);
+        *out_volume = entries[pick].volume;
+        found = true;
+    }
+
+    heap_caps_free(entries);
+    heap_caps_free(candidates);
     return found;
 }
 
@@ -1316,19 +1428,55 @@ static void play_generated_tone_chime(void) {
     heap_caps_free(buf);
 }
 
-// Single entry point: try an SD-card WAV first, fall back to the
-// generated tone. Handles its own audio power-on/off, matching the
-// pattern used by run_push_to_talk_cycle() elsewhere in this file.
-static void play_reminder_chime(void) {
+// Four-tier fallback chain, in priority order:
+//   1. Pinned -- pinned_sound_id set (dashboard test trigger) -> play that
+//      exact backend-synced file at its own volume.
+//   2. Random from the backend-synced library (ALERT_SOUND_DIR), each
+//      sound at its own volume -- the normal "non-test" case.
+//   3. Random from the legacy, purely user-managed CHIME_DIR/notesnd
+//      folder at the flat CHIME_VOLUME_PERCENT -- today's original
+//      behavior, untouched, kept as a fallback for a device that hasn't
+//      synced yet or whose synced library is currently empty.
+//   4. Generated tone -- ultimate fallback.
+// Handles its own audio power-on/off, matching the pattern used by
+// run_push_to_talk_cycle() elsewhere in this file.
+static void play_reminder_chime(const char *pinned_sound_id, int pinned_sound_volume) {
     BoardPower_Audio_ON();
     Codec_StartInit();
-    Codec_SetPlaybackVolume(CHIME_VOLUME_PERCENT);
 
     bool played = false;
-    char wav_path[160];
-    if (ensure_sdcard_mounted() && find_random_wav_in_notesnd(wav_path, sizeof(wav_path))) {
-        played = play_wav_file(wav_path);
+    bool sd_ok = ensure_sdcard_mounted();
+
+    // Backend-controlled sounds (tiers 1-2) use their own `volume` as the
+    // actual target hardware level, per spec ("100 = play as-is") -- not
+    // scaled by CHIME_VOLUME_PERCENT on top, which would silently
+    // compound the two and make even volume=100 play back quiet.
+    // CHIME_VOLUME_PERCENT stays in effect only for the legacy fallback
+    // tiers below, which have no per-sound volume of their own.
+    if (sd_ok && pinned_sound_id && pinned_sound_id[0] != '\0') {
+        char pinned_path[96];
+        snprintf(pinned_path, sizeof(pinned_path), "%s/%s.wav", ALERT_SOUND_DIR, pinned_sound_id);
+        Codec_SetPlaybackVolume(pinned_sound_volume);
+        played = play_wav_file(pinned_path); // false (already logs a WARN) if missing/corrupt -- falls through below
     }
+
+    if (!played && sd_ok) {
+        char synced_path[96];
+        int synced_volume = 100;
+        if (find_random_synced_alert_sound(synced_path, sizeof(synced_path), &synced_volume)) {
+            Codec_SetPlaybackVolume(synced_volume);
+            played = play_wav_file(synced_path);
+        }
+    }
+
+    if (!played) {
+        Codec_SetPlaybackVolume(CHIME_VOLUME_PERCENT); // reset -- an earlier tier may have scaled volume down
+        char wav_path[160];
+        if (sd_ok && find_random_wav_in_notesnd(wav_path, sizeof(wav_path))) {
+            played = play_wav_file(wav_path);
+        }
+    }
+
     if (!played) {
         play_generated_tone_chime();
     }
@@ -1360,7 +1508,7 @@ static bool handle_due_reminder(const sync_soonest_reminder_t &soonest) {
     }
 
     ESP_LOGI(TAG, "reminder due: playing chime for id=%s", soonest.id);
-    play_reminder_chime();
+    play_reminder_chime(soonest.alert_sound_id, soonest.alert_sound_volume);
     strncpy(s_last_announced_reminder_id, soonest.id, sizeof(s_last_announced_reminder_id) - 1);
     s_last_announced_reminder_id[sizeof(s_last_announced_reminder_id) - 1] = '\0';
     return true;
@@ -1380,6 +1528,9 @@ static sync_soonest_reminder_t find_soonest_cached_reminder(void) {
             result.id[sizeof(result.id) - 1] = '\0';
             strncpy(result.message, s_pending_reminders[i].message, sizeof(result.message) - 1);
             result.message[sizeof(result.message) - 1] = '\0';
+            strncpy(result.alert_sound_id, s_pending_reminders[i].alert_sound_id, sizeof(result.alert_sound_id) - 1);
+            result.alert_sound_id[sizeof(result.alert_sound_id) - 1] = '\0';
+            result.alert_sound_volume = s_pending_reminders[i].alert_sound_volume;
         }
     }
     return result;
@@ -1805,6 +1956,270 @@ static void flush_pending_voice_notes(void) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Backend-synced alert sound library. Diffs snap->alert_sounds[] (from
+// this cycle's /device/sync response) against ALERT_SOUND_MANIFEST_PATH,
+// fetches new/changed files, prunes files the backend no longer lists,
+// and rewrites the manifest. Bounded and non-fatal by construction --
+// every failure path here just returns/continues, never aborts the sync
+// cycle -- per CLAUDE.md's "never let a retry loop, crash, or sync
+// failure burn battery or brick the device."
+// ---------------------------------------------------------------------
+
+#define ALERT_SOUND_SYNC_BUDGET_MS (60 * 1000) // generous for KB-scale clips
+#define ALERT_SOUND_FETCH_ESTIMATE_MS 5000     // flat look-ahead estimate per file
+
+static bool sha256_file(const char *path, uint8_t out_digest[32]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    bool ok = mbedtls_sha256_starts(&ctx, 0) == 0; // 0 = SHA-256, not SHA-224
+    // Small on purpose -- this runs deep in a call chain sharing the
+    // 8192-byte main task stack with the rest of a wake cycle.
+    uint8_t buf[256];
+    size_t got;
+    while (ok && (got = fread(buf, 1, sizeof(buf), f)) > 0) {
+        ok = mbedtls_sha256_update(&ctx, buf, got) == 0;
+    }
+    ok = ok && feof(f) && !ferror(f);
+    fclose(f);
+    if (ok) {
+        ok = mbedtls_sha256_finish(&ctx, out_digest) == 0;
+    }
+    mbedtls_sha256_free(&ctx);
+    return ok;
+}
+
+static void hex_encode(const uint8_t *data, size_t len, char *out_hex) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out_hex[i * 2] = digits[(data[i] >> 4) & 0xF];
+        out_hex[i * 2 + 1] = digits[data[i] & 0xF];
+    }
+    out_hex[len * 2] = '\0';
+}
+
+// GET sound->url (backend-provided full path fragment, e.g.
+// "/device/alert-sounds/{id}") straight to <id>.wav.part, verify its
+// sha256 against sound->sha256, then rename into place. No temp-file
+// precedent for downloads exists elsewhere in this file (the voice
+// queue uses a different finalize-in-place trick suited to incremental
+// recording, not a whole-file fetch) -- write-verify-rename is simpler
+// and correct here: a torn/failed download never leaves a wrong or
+// partial file at the final path.
+static bool download_alert_sound_file(const sync_alert_sound_t *sound) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s%s", BACKEND_BASE_URL, sound->url);
+
+    char part_path[96], final_path[96];
+    snprintf(part_path, sizeof(part_path), "%s/%s.wav.part", ALERT_SOUND_DIR, sound->id);
+    snprintf(final_path, sizeof(final_path), "%s/%s.wav", ALERT_SOUND_DIR, sound->id);
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 15000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "auth", API_TOKEN);
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return false;
+    }
+    if (esp_http_client_fetch_headers(client) < 0) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+    int status = esp_http_client_get_status_code(client);
+    if (status < 200 || status >= 300) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    FILE *f = fopen(part_path, "wb");
+    if (!f) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    const size_t CHUNK_BYTES = 2048;
+    auto *chunk = static_cast<uint8_t *>(heap_caps_malloc(CHUNK_BYTES, MALLOC_CAP_SPIRAM));
+    bool read_ok = (chunk != nullptr);
+    int n = 0;
+    while (read_ok && (n = esp_http_client_read(client, reinterpret_cast<char *>(chunk), CHUNK_BYTES)) > 0) {
+        if (fwrite(chunk, 1, (size_t)n, f) != (size_t)n) {
+            read_ok = false;
+        }
+    }
+    if (n < 0) {
+        read_ok = false;
+    }
+    if (chunk) {
+        heap_caps_free(chunk);
+    }
+    fclose(f);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (!read_ok) {
+        remove(part_path);
+        return false;
+    }
+
+    uint8_t digest[32];
+    if (!sha256_file(part_path, digest)) {
+        remove(part_path);
+        return false;
+    }
+    char hex[SYNC_STR_SHA256_LEN];
+    hex_encode(digest, sizeof(digest), hex);
+    if (strcasecmp(hex, sound->sha256) != 0) {
+        ESP_LOGW(TAG, "alert sound %s: sha256 mismatch after download", sound->id);
+        record_device_error("alert_sound_sha_mismatch", sound->id);
+        remove(part_path);
+        return false;
+    }
+
+    remove(final_path); // stale prior file, if any -- best-effort, ENOENT fine
+    if (rename(part_path, final_path) != 0) {
+        ESP_LOGW(TAG, "alert sound %s: rename to final path failed", sound->id);
+        remove(part_path);
+        return false;
+    }
+    return true;
+}
+
+// Bounded retry, reusing sync_backoff_t exactly like device_sync() does --
+// this is closer in shape to /device/sync (bounded attempts on a single
+// request) than to the voice queue (deliberately one-attempt-per-wake,
+// retried across wakes instead).
+static bool fetch_alert_sound_with_retry(const sync_alert_sound_t *sound) {
+    sync_backoff_t backoff;
+    sync_backoff_reset(&backoff);
+    bool ok = false;
+    while (sync_backoff_should_retry(&backoff)) {
+        sync_backoff_record_attempt(&backoff);
+        ok = download_alert_sound_file(sound);
+        if (ok) {
+            break;
+        }
+        if (sync_backoff_should_retry(&backoff)) {
+            vTaskDelay(pdMS_TO_TICKS(sync_backoff_delay_ms(&backoff)));
+        }
+    }
+    return ok;
+}
+
+static void copy_alert_sound_manifest_entry(alert_sound_manifest_entry_t *dst, const sync_alert_sound_t *src) {
+    strncpy(dst->id, src->id, sizeof(dst->id) - 1);
+    dst->id[sizeof(dst->id) - 1] = '\0';
+    strncpy(dst->sha256, src->sha256, sizeof(dst->sha256) - 1);
+    dst->sha256[sizeof(dst->sha256) - 1] = '\0';
+    dst->volume = src->volume;
+}
+
+// Called once per full sync, right after a snapshot parses successfully
+// (see the call site in app_main), before any reminder is acted on --
+// so a reminder that becomes due this same cycle with a newly-pinned
+// sound already has that sound on disk before the chime fires.
+static void reconcile_alert_sound_library(const sync_snapshot_t *snap) {
+    if (!snap->alert_sounds_valid) {
+        return; // section missing/malformed this cycle -- leave library untouched
+    }
+    if (!ensure_sdcard_mounted()) {
+        return; // ensure_sdcard_mounted() already records its own error once per boot
+    }
+    mkdir(ALERT_SOUND_DIR, 0755); // ignore EEXIST -- already-there is the common case
+
+    // Heap/PSRAM, not stack locals -- the main task stack is only 8192
+    // bytes total (CONFIG_ESP_MAIN_TASK_STACK_SIZE), and this function
+    // runs directly inside app_main's own call chain. Two
+    // SYNC_MAX_ALERT_SOUNDS-sized arrays of this struct as stack locals
+    // overflowed it on real hardware -- same lesson stream_voice_
+    // multipart_body()'s chunk buffer already had to learn elsewhere in
+    // this file.
+    auto *old_manifest = static_cast<alert_sound_manifest_entry_t *>(
+        heap_caps_malloc(sizeof(alert_sound_manifest_entry_t) * SYNC_MAX_ALERT_SOUNDS, MALLOC_CAP_SPIRAM));
+    auto *new_manifest = static_cast<alert_sound_manifest_entry_t *>(
+        heap_caps_malloc(sizeof(alert_sound_manifest_entry_t) * SYNC_MAX_ALERT_SOUNDS, MALLOC_CAP_SPIRAM));
+    if (!old_manifest || !new_manifest) {
+        ESP_LOGE(TAG, "alert sound sync: failed to allocate manifest buffers");
+        heap_caps_free(old_manifest);
+        heap_caps_free(new_manifest);
+        return;
+    }
+
+    int old_count = load_alert_sound_manifest(old_manifest, SYNC_MAX_ALERT_SOUNDS);
+
+    // Prune: delete any cached file the backend no longer lists.
+    for (int i = 0; i < old_count; i++) {
+        bool still_present = false;
+        for (int j = 0; j < snap->alert_sounds_count; j++) {
+            if (strcmp(old_manifest[i].id, snap->alert_sounds[j].id) == 0) {
+                still_present = true;
+                break;
+            }
+        }
+        if (!still_present) {
+            char path[96];
+            snprintf(path, sizeof(path), "%s/%s.wav", ALERT_SOUND_DIR, old_manifest[i].id);
+            remove(path);
+        }
+    }
+
+    // Fetch + rebuild manifest. The time budget only gates *new* fetches
+    // -- an already-correct entry is carried forward unconditionally
+    // (costs nothing this cycle, and its volume is refreshed from this
+    // cycle's snapshot even though the file itself doesn't need
+    // re-fetching, since volume can change without the hash changing),
+    // so a budget cutoff mid-loop never drops good entries out of the
+    // manifest.
+    int new_count = 0;
+    int64_t elapsed_ms = 0;
+    bool fetched_anything_yet = false;
+
+    for (int j = 0; j < snap->alert_sounds_count && new_count < SYNC_MAX_ALERT_SOUNDS; j++) {
+        const sync_alert_sound_t *sound = &snap->alert_sounds[j];
+        bool need_fetch = true;
+        for (int i = 0; i < old_count; i++) {
+            if (strcmp(old_manifest[i].id, sound->id) == 0 && strcasecmp(old_manifest[i].sha256, sound->sha256) == 0) {
+                need_fetch = false;
+                break;
+            }
+        }
+        if (!need_fetch) {
+            copy_alert_sound_manifest_entry(&new_manifest[new_count++], sound);
+            continue;
+        }
+        if (fetched_anything_yet && elapsed_ms + ALERT_SOUND_FETCH_ESTIMATE_MS > ALERT_SOUND_SYNC_BUDGET_MS) {
+            ESP_LOGI(TAG, "alert sound sync: budget spent, %d sound(s) left for next cycle",
+                     snap->alert_sounds_count - j);
+            break;
+        }
+        int64_t t0 = esp_timer_get_time();
+        bool ok = fetch_alert_sound_with_retry(sound);
+        elapsed_ms += (esp_timer_get_time() - t0) / 1000;
+        fetched_anything_yet = true;
+        if (ok) {
+            copy_alert_sound_manifest_entry(&new_manifest[new_count++], sound);
+        }
+        // else: left out of the manifest -- retried again next full sync
+    }
+
+    write_alert_sound_manifest(new_manifest, new_count);
+
+    heap_caps_free(old_manifest);
+    heap_caps_free(new_manifest);
+}
+
 // F7: POST /device/checkin/{id}/skip -- no request body (spec section
 // 3.3). Note the /device prefix: POST /checkin/{id}/skip (no /device) is
 // a *different* endpoint for the backend's own magic-link flow and does
@@ -1915,7 +2330,7 @@ struct ptt_recording_result_t {
 // on any early-exit path; have_pending_file stays false whenever there's
 // nothing worth uploading (SD unavailable, header write failed, or a
 // zero-byte take).
-static ptt_recording_result_t record_ptt_take_to_pending_file(bool have_live_checkin) {
+static ptt_recording_result_t record_ptt_take_to_pending_file(bool have_live_checkin, int battery_pct) {
     ptt_recording_result_t result = {};
 
     if (!ensure_sdcard_mounted()) {
@@ -1963,7 +2378,7 @@ static ptt_recording_result_t record_ptt_take_to_pending_file(bool have_live_che
     }
 
     if (have_live_checkin) {
-        eink_show_checkin_recording(s_last_screen.checkin_prompt);
+        eink_show_checkin_recording(battery_pct);
     } else {
         eink_show_message("RECORDING... PRESS BOOT TO STOP");
     }
@@ -2084,7 +2499,7 @@ static void run_push_to_talk_cycle(void) {
     I2cMasterBus::requestInstance(ESP32_I2C_SCL_PIN, ESP32_I2C_SDA_PIN, ESP32_I2C_DEV_NUM);
     Codec_StartInit();
 
-    ptt_recording_result_t rec = record_ptt_take_to_pending_file(have_live_checkin);
+    ptt_recording_result_t rec = record_ptt_take_to_pending_file(have_live_checkin, battery_pct);
     if (rec.have_pending_file) {
         upload_and_finish_ptt_take(rec, have_live_checkin, battery_pct);
     }
@@ -2221,9 +2636,10 @@ extern "C" void app_main(void) {
 
     bool wifi_ok = wifi_connect();
 
-    // sync_snapshot_t is ~8.4KB -- far too large for the 3.5KB main task
-    // stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE), so it must live in
-    // heap/PSRAM, not as a stack local. Kept alive (not freed) until
+    // sync_snapshot_t is ~8.4KB -- larger than the entire 8KB main task
+    // stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192, sdkconfig.defaults), so
+    // it must live in heap/PSRAM, not as a stack local. Kept alive (not
+    // freed) until
     // after rendering below -- F4 (PROJECT_PLAN.md) needs the parsed
     // snapshot to draw real content, not just to extract TZ/RTC/poll
     // interval as before.
@@ -2254,6 +2670,7 @@ extern "C" void app_main(void) {
             if (sync_snapshot_parse(resp.data, snap)) {
                 have_fresh_snapshot = true;
                 log_snapshot(*snap);
+                reconcile_alert_sound_library(snap);
                 if (snap->has_timezone_posix) {
                     strncpy(s_tz_posix, snap->timezone_posix, sizeof(s_tz_posix) - 1);
                     s_tz_posix[sizeof(s_tz_posix) - 1] = '\0';
@@ -2353,6 +2770,8 @@ extern "C" void app_main(void) {
                 strncpy(s_pending_reminders[i].message, snap->reminders[i].message, sizeof(s_pending_reminders[i].message) - 1);
                 s_pending_reminders[i].message[sizeof(s_pending_reminders[i].message) - 1] = '\0';
                 s_pending_reminders[i].due_at = snap->reminders[i].due_at;
+                sync_resolve_alert_sound(snap, &snap->reminders[i], s_pending_reminders[i].alert_sound_id,
+                                          sizeof(s_pending_reminders[i].alert_sound_id), &s_pending_reminders[i].alert_sound_volume);
             }
         } else {
             s_pending_reminders_count = 0;

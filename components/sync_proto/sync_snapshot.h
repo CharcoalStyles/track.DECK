@@ -2,6 +2,7 @@
 #define SYNC_SNAPSHOT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -11,9 +12,12 @@ extern "C" {
 #define SYNC_MAX_CHECKINS 8
 #define SYNC_MAX_REMINDERS 8
 #define SYNC_MAX_CALENDAR_EVENTS 8
+#define SYNC_MAX_ALERT_SOUNDS 16
 #define SYNC_STR_ID_LEN 40
 #define SYNC_STR_SHORT_LEN 32
 #define SYNC_STR_TEXT_LEN 256
+#define SYNC_STR_SHA256_LEN 65 // 64 hex chars + NUL
+#define SYNC_STR_URL_LEN 80
 
 typedef struct {
     char id[SYNC_STR_ID_LEN];
@@ -30,7 +34,17 @@ typedef struct {
     int64_t due_at;
     bool has_event_uid;
     char event_uid[SYNC_STR_ID_LEN];
+    bool has_alert_sound_id;
+    char alert_sound_id[SYNC_STR_ID_LEN];
 } sync_reminder_t;
+
+typedef struct {
+    char id[SYNC_STR_ID_LEN];
+    char sha256[SYNC_STR_SHA256_LEN];
+    int size_bytes;
+    int volume; // 0-100, always populated (clamped; defaults to 100 if missing/malformed)
+    char url[SYNC_STR_URL_LEN];
+} sync_alert_sound_t;
 
 typedef struct {
     char uid[SYNC_STR_ID_LEN];
@@ -81,6 +95,10 @@ typedef struct {
     int calendar_events_count;
     sync_calendar_event_t calendar_events[SYNC_MAX_CALENDAR_EVENTS];
 
+    bool alert_sounds_valid;
+    int alert_sounds_count;
+    sync_alert_sound_t alert_sounds[SYNC_MAX_ALERT_SOUNDS];
+
     bool has_weather;
     sync_weather_t weather;
 } sync_snapshot_t;
@@ -96,14 +114,25 @@ typedef struct {
     char id[SYNC_STR_ID_LEN];
     char message[SYNC_STR_TEXT_LEN];
     int64_t due_at;
+    char alert_sound_id[SYNC_STR_ID_LEN]; // empty string = unpinned
+    int alert_sound_volume;               // meaningful only when alert_sound_id[0] != '\0'
 } sync_soonest_reminder_t;
 
 /* Soonest-due reminder by due_at (past or future -- caller compares
  * against "now" themselves). Calendar events are deliberately excluded --
  * only reminders drive the reminder-wake/chime feature, unlike
- * find_next_item()'s merged reminders+events display logic in the
+ * find_today_items()'s merged reminders+events display logic in the
  * firmware app itself. */
 sync_soonest_reminder_t sync_find_soonest_reminder(const sync_snapshot_t *snap);
+
+/* Resolves reminder->alert_sound_id (if set) against snap->alert_sounds[].
+ * Writes out_id[0] = '\0' and *out_volume = 100 if the reminder has no pin,
+ * if snap->alert_sounds_valid is false, or if the pinned id doesn't match
+ * any parsed alert_sounds[] entry -- degrades to "no pin" rather than trust
+ * an unresolvable id, matching this file's "malformed data degrades
+ * gracefully" convention. */
+void sync_resolve_alert_sound(const sync_snapshot_t *snap, const sync_reminder_t *reminder,
+                               char *out_id, size_t out_id_size, int *out_volume);
 
 #ifdef __cplusplus
 }

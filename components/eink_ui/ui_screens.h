@@ -9,19 +9,13 @@
 // owns the panel write, same contract eink_lvgl_draw_dashboard() used to
 // have.
 
-// Status bar (time/battery/weather) + the soonest reminder/event, or blank
-// if state.next.have_next is false. Shared by the normal dashboard, the
-// restored last-known dashboard, and (with state.next set to the reminder
-// that just fired) the F9 reminder-override screen.
+// Status bar (time/battery/weather), the soonest reminder/event, and below
+// that either a live check-in's prompt (state.checkin_prompt non-null,
+// header picked by state.checkin_replying) or the rest of today's
+// reminders/events (state.remaining). Shared by the normal dashboard, the
+// restored last-known dashboard, the F9 reminder-override screen, and the
+// "replying to a check-in" screen.
 void ui_screens_render_dashboard(const device_ui_state_t &state);
-
-// Status bar + a live check-in's prompt taking over the content area.
-void ui_screens_render_checkin(const device_ui_state_t &state);
-
-// "REPLYING..." header + the prompt being replied to, same layout as the
-// check-in screen's content area. No status bar (matches the screen it
-// replaces, eink_show_checkin_recording()).
-void ui_screens_render_recording(const char *prompt_text);
 
 // A short wrapped message, no status bar. Used for transient PTT/check-in
 // status text ("SENDING...", "SENT", ...).
@@ -30,9 +24,10 @@ void ui_screens_render_message(const char *message);
 // PWR-hold shutdown screen: two centered lines, no status bar.
 void ui_screens_render_shutdown(const char *line1, const char *line2);
 
-// Small bottom-right "N/max" pending-voice-note badge, drawn as a second,
-// small canvas over whatever screen was just rendered. Draws nothing when
-// count <= 0, matching the badge's original silent-when-empty behavior.
-void ui_screens_render_pending_voice_badge(int count, int max_count);
+// Bottom footer strip: pending-voice-note "N/max" badge (bottom-right) and,
+// when notice is non-null (e.g. F8's "SYNC FAILED"), a notice (bottom-left)
+// -- drawn together in one small canvas over whatever screen was just
+// rendered. Draws nothing when count <= 0 and notice is null.
+void ui_screens_render_footer(int count, int max_count, const char *notice);
 
 #endif // UI_SCREENS_H

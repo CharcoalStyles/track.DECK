@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstring>
+#include <string>
 
 extern "C" {
 #include "sync_snapshot.h"
@@ -232,4 +233,152 @@ TEST_CASE("sync_find_soonest_reminder: calendar events are ignored, only reminde
     REQUIRE(soonest.have_reminder);
     REQUIRE(std::string(soonest.id) == "r1");
     REQUIRE(soonest.due_at == 5000);
+}
+
+TEST_CASE("parses a full alert_sounds array, ignoring duration_seconds", "[alert_sounds]") {
+    const char *json = R"({
+      "alert_sounds": [
+        {
+          "id": "3f1e9c2a-1111",
+          "sha256": "b5b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+          "size_bytes": 48044,
+          "duration_seconds": 1.5,
+          "volume": 75,
+          "url": "/device/alert-sounds/3f1e9c2a-1111"
+        },
+        {
+          "id": "3f1e9c2a-2222",
+          "sha256": "c6c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+          "size_bytes": 12000,
+          "volume": 100,
+          "url": "/device/alert-sounds/3f1e9c2a-2222"
+        }
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE(snap.alert_sounds_valid);
+    REQUIRE(snap.alert_sounds_count == 2);
+    REQUIRE(std::string(snap.alert_sounds[0].id) == "3f1e9c2a-1111");
+    REQUIRE(std::string(snap.alert_sounds[0].sha256) == "b5b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1");
+    REQUIRE(snap.alert_sounds[0].size_bytes == 48044);
+    REQUIRE(snap.alert_sounds[0].volume == 75);
+    REQUIRE(std::string(snap.alert_sounds[0].url) == "/device/alert-sounds/3f1e9c2a-1111");
+    REQUIRE(snap.alert_sounds[1].volume == 100);
+}
+
+TEST_CASE("alert_sounds section absent -> alert_sounds_valid=false", "[alert_sounds]") {
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse("{}", &snap));
+    REQUIRE_FALSE(snap.alert_sounds_valid);
+    REQUIRE(snap.alert_sounds_count == 0);
+}
+
+TEST_CASE("alert_sounds volume missing defaults to 100", "[alert_sounds]") {
+    const char *json = R"({"alert_sounds": [{"id": "s1", "sha256": "x", "size_bytes": 1, "url": "/u"}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE(snap.alert_sounds_count == 1);
+    REQUIRE(snap.alert_sounds[0].volume == 100);
+}
+
+TEST_CASE("alert_sounds volume out of range clamps to 0-100", "[alert_sounds]") {
+    const char *json = R"({
+      "alert_sounds": [
+        {"id": "s1", "sha256": "x", "size_bytes": 1, "url": "/u", "volume": 150},
+        {"id": "s2", "sha256": "x", "size_bytes": 1, "url": "/u", "volume": -5}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE(snap.alert_sounds[0].volume == 100);
+    REQUIRE(snap.alert_sounds[1].volume == 0);
+}
+
+TEST_CASE("alert_sounds volume of the wrong type defaults to 100", "[alert_sounds]") {
+    const char *json = R"({"alert_sounds": [{"id": "s1", "sha256": "x", "size_bytes": 1, "url": "/u", "volume": "loud"}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE(snap.alert_sounds[0].volume == 100);
+}
+
+TEST_CASE("alert_sounds entries beyond the cap are dropped, not overflowed", "[alert_sounds]") {
+    std::string json = R"({"alert_sounds": [)";
+    for (int i = 0; i < SYNC_MAX_ALERT_SOUNDS + 5; i++) {
+        if (i > 0) json += ",";
+        json += "{\"id\": \"s" + std::to_string(i) + "\", \"sha256\": \"x\", \"size_bytes\": 1, \"url\": \"/u\"}";
+    }
+    json += "]}";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json.c_str(), &snap));
+    REQUIRE(snap.alert_sounds_count == SYNC_MAX_ALERT_SOUNDS);
+}
+
+TEST_CASE("reminders alert_sound_id: null degrades to unpinned", "[alert_sounds]") {
+    const char *json = R"({"reminders": [{"id": "r1", "message": "m", "due_at": 1, "alert_sound_id": null}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE_FALSE(snap.reminders[0].has_alert_sound_id);
+}
+
+TEST_CASE("reminders alert_sound_id key absent degrades to unpinned", "[alert_sounds]") {
+    const char *json = R"({"reminders": [{"id": "r1", "message": "m", "due_at": 1}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE_FALSE(snap.reminders[0].has_alert_sound_id);
+}
+
+TEST_CASE("sync_find_soonest_reminder resolves a matching pinned alert_sound_id", "[alert_sounds]") {
+    const char *json = R"({
+      "alert_sounds": [
+        {"id": "snd1", "sha256": "x", "size_bytes": 1, "volume": 60, "url": "/u"}
+      ],
+      "reminders": [
+        {"id": "r1", "message": "m", "due_at": 1, "alert_sound_id": "snd1"}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE(std::string(soonest.alert_sound_id) == "snd1");
+    REQUIRE(soonest.alert_sound_volume == 60);
+}
+
+TEST_CASE("sync_find_soonest_reminder degrades a pinned id that matches nothing", "[alert_sounds]") {
+    const char *json = R"({
+      "alert_sounds": [
+        {"id": "snd1", "sha256": "x", "size_bytes": 1, "volume": 60, "url": "/u"}
+      ],
+      "reminders": [
+        {"id": "r1", "message": "m", "due_at": 1, "alert_sound_id": "does-not-exist"}
+      ]
+    })";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    sync_soonest_reminder_t soonest = sync_find_soonest_reminder(&snap);
+    REQUIRE(std::string(soonest.alert_sound_id).empty());
+    REQUIRE(soonest.alert_sound_volume == 100);
+}
+
+TEST_CASE("sync_resolve_alert_sound: unpinned reminder", "[alert_sounds]") {
+    const char *json = R"({"reminders": [{"id": "r1", "message": "m", "due_at": 1}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    char id[SYNC_STR_ID_LEN];
+    int volume;
+    sync_resolve_alert_sound(&snap, &snap.reminders[0], id, sizeof(id), &volume);
+    REQUIRE(std::string(id).empty());
+    REQUIRE(volume == 100);
+}
+
+TEST_CASE("sync_resolve_alert_sound: pinned but alert_sounds section invalid", "[alert_sounds]") {
+    const char *json = R"({"reminders": [{"id": "r1", "message": "m", "due_at": 1, "alert_sound_id": "snd1"}]})";
+    sync_snapshot_t snap;
+    REQUIRE(sync_snapshot_parse(json, &snap));
+    REQUIRE_FALSE(snap.alert_sounds_valid);
+    char id[SYNC_STR_ID_LEN];
+    int volume;
+    sync_resolve_alert_sound(&snap, &snap.reminders[0], id, sizeof(id), &volume);
+    REQUIRE(std::string(id).empty());
+    REQUIRE(volume == 100);
 }

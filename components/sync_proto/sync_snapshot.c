@@ -98,7 +98,46 @@ static void parse_reminders(const cJSON *root, sync_snapshot_t *out) {
         get_str_field(entry, "message", r->message, sizeof(r->message));
         get_int64_field(entry, "due_at", &r->due_at);
         r->has_event_uid = get_str_field(entry, "event_uid", r->event_uid, sizeof(r->event_uid));
+        r->has_alert_sound_id = get_str_field(entry, "alert_sound_id", r->alert_sound_id, sizeof(r->alert_sound_id));
         out->reminders_count++;
+    }
+}
+
+static void parse_alert_sounds(const cJSON *root, sync_snapshot_t *out) {
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "alert_sounds");
+    if (!cJSON_IsArray(arr)) {
+        out->alert_sounds_valid = false;
+        return;
+    }
+    out->alert_sounds_valid = true;
+    out->alert_sounds_count = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, arr) {
+        if (out->alert_sounds_count >= SYNC_MAX_ALERT_SOUNDS) {
+            break;
+        }
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        sync_alert_sound_t *s = &out->alert_sounds[out->alert_sounds_count];
+        memset(s, 0, sizeof(*s));
+        get_str_field(entry, "id", s->id, sizeof(s->id));
+        get_str_field(entry, "sha256", s->sha256, sizeof(s->sha256));
+        get_int_field(entry, "size_bytes", &s->size_bytes);
+        get_str_field(entry, "url", s->url, sizeof(s->url));
+
+        int volume;
+        if (!get_int_field(entry, "volume", &volume)) {
+            volume = 100;
+        }
+        if (volume < 0) {
+            volume = 0;
+        } else if (volume > 100) {
+            volume = 100;
+        }
+        s->volume = volume;
+
+        out->alert_sounds_count++;
     }
 }
 
@@ -178,6 +217,7 @@ bool sync_snapshot_parse(const char *json_text, sync_snapshot_t *out) {
     parse_checkins(root, out);
     parse_reminders(root, out);
     parse_calendar_events(root, out);
+    parse_alert_sounds(root, out);
     parse_weather(root, out);
 
     cJSON_Delete(root);
@@ -197,7 +237,29 @@ sync_soonest_reminder_t sync_find_soonest_reminder(const sync_snapshot_t *snap) 
             result.due_at = snap->reminders[i].due_at;
             copy_str(result.id, sizeof(result.id), snap->reminders[i].id);
             copy_str(result.message, sizeof(result.message), snap->reminders[i].message);
+            sync_resolve_alert_sound(snap, &snap->reminders[i], result.alert_sound_id,
+                                      sizeof(result.alert_sound_id), &result.alert_sound_volume);
         }
     }
     return result;
+}
+
+void sync_resolve_alert_sound(const sync_snapshot_t *snap, const sync_reminder_t *reminder,
+                               char *out_id, size_t out_id_size, int *out_volume) {
+    out_id[0] = '\0';
+    *out_volume = 100;
+
+    if (!reminder->has_alert_sound_id || reminder->alert_sound_id[0] == '\0') {
+        return;
+    }
+    if (!snap->alert_sounds_valid) {
+        return;
+    }
+    for (int i = 0; i < snap->alert_sounds_count; i++) {
+        if (strcmp(snap->alert_sounds[i].id, reminder->alert_sound_id) == 0) {
+            copy_str(out_id, out_id_size, reminder->alert_sound_id);
+            *out_volume = snap->alert_sounds[i].volume;
+            return;
+        }
+    }
 }
